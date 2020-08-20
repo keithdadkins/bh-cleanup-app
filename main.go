@@ -40,7 +40,10 @@ type Config struct {
 	DupBuffer        int    `envconfig:"BH_DUP_BUFFER"`
 }
 
-// queueBatch represents the sql statement our queue workers will process to find unique bene id's
+// queueBatch represents the sql our queue workers will process to find unique bene id's
+// e.g., 'select foo from bigtable offset 1000 limit 1000'. The limit (how many rows per
+// batch to process) is configured via the environment variable BH_QUEUE_FEED_LIMIT. The
+// offset is used as a sort of pagination.
 type queueBatch struct {
 	Offset uint64 `json:"offset"`
 	Limit  uint64 `json:"limit"`
@@ -48,7 +51,7 @@ type queueBatch struct {
 
 // tuning defaults
 const (
-	numQueueWorkersDefault = 2  // number of workers adding benes to the queue. (keep this small)
+	numQueueWorkersDefault = 3  // number of workers adding benes to the queue. (keep this small)
 	numDupWorkersDefault   = 16 // number of workers running delete from queries
 )
 
