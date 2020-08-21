@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -38,7 +39,7 @@ type Config struct {
 	NumQueueWorkers   int    `envconfig:"BH_NUM_QUEUE_WORKERS"`
 	QueueFeedLimit    uint64 `envconfig:"BH_QUEUE_FEED_LIMIT"`
 	QueueBuffer       uint64 `envconfig:"BH_QUEUE_BUFFER"`
-	NumbeneWorkers    int    `envconfig:"BH_NUM_DUP_WORKERS"`
+	numBeneWorkers    int    `envconfig:"BH_NUM_DUP_WORKERS"`
 	DupBuffer         int    `envconfig:"BH_DUP_BUFFER"`
 	MbiHashPepper     string `envconfig:"BH_MBI_HASH_PEPPER"`
 	MbiHashIterations int    `envconfig:"BH_MBI_HASH_ITERATIONS"`
@@ -54,11 +55,8 @@ type queueBatch struct {
 	Limit  uint64 `json:"limit"`
 }
 
-// tuning defaults
-const (
-	numQueueWorkersDefault = 3  // number of workers adding benes to the queue. (keep this small)
-	numbeneWorkersDefault  = 16 // number of workers running delete from queries
-)
+// default number of workers adding benes to the queue. (keep this small to reduce lock contention in badger)
+const numQueueWorkersDefault = 3
 
 // queue query pattern
 const queuePattern = "SELECT \"beneficiaryId\" FROM \"BeneficiariesHistory\" OFFSET $1 LIMIT $2 ;"
@@ -82,6 +80,12 @@ WHERE
 ) dups 
 WHERE dups.row > 1)
 DELETE FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "beneficiaryHistoryId" IN (SELECT "beneficiaryHistoryId" FROM x)`
+
+// mbi hash select pattern
+const mbiHashSelector = `SELECT "beneficiaryHistoryId" FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL`
+
+// mbi hash update pattern
+const updateHashPattern = `UPDATE "BeneficiariesHistory" SET "mbiHash" = $1 WHERE "beneficiaryHistoryId" = $2`
 
 // gets the current amount of "actual" free memory.
 func freeMem() gosigar.Mem {
@@ -155,9 +159,26 @@ func badgerCloseHandler(queue *badger.DB) {
 }
 
 // hashes mbi using PBKDF2-HMAC-SHA256 (see .env) and sets *mbiHash to the result
-func mbiHash(mbiHash *string, mbi []byte, cfg *Config) {
-	tmp := pbkdf2.Key(mbi, []byte(cfg.MbiHashPepper), cfg.MbiHashIterations, cfg.MbiHashLength, sha256.New)
+func hashMBI(mbiHash *string, mbi []byte, cfg *Config) error {
+	// decode the pepper from hex
+	pepper, err := hex.DecodeString(cfg.MbiHashPepper)
+	if err != nil {
+		return err
+	}
+
+	// hash the mbi and set *mbiHash to the result
+	tmp := pbkdf2.Key(mbi, pepper, cfg.MbiHashIterations, cfg.MbiHashLength, sha256.New)
 	*mbiHash = fmt.Sprintf("%x", string(tmp))
+	return nil
+}
+
+// test hashing function
+func testHash(testmbi string, expected string, cfg *Config) bool {
+	beneMbi := []byte(testmbi)
+	var mbiHash string
+	hashMBI(&mbiHash, beneMbi, cfg)
+	result := mbiHash == expected
+	return result
 }
 
 // searches the history table for unique benes to add to the queue
@@ -367,11 +388,11 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupCounter 
 	fmt.Printf("connected to %v.\n", cfg.RwDbHost)
 
 	// determine how many workers to use
-	var numbeneWorkers int
+	var numBeneWorkers int
 	if cfg.NumQueueWorkers > 0 {
-		numbeneWorkers = cfg.NumbeneWorkers
+		numBeneWorkers = cfg.numBeneWorkers
 	} else {
-		numbeneWorkers = runtime.NumCPU()
+		numBeneWorkers = runtime.NumCPU()
 	}
 
 	// set buffer value
@@ -386,7 +407,7 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupCounter 
 	var dupChan = make(chan *badger.Item, dupBuffer)
 	var wg sync.WaitGroup
 	var i int
-	for i = 0; i < numbeneWorkers; i++ {
+	for i = 0; i < numBeneWorkers; i++ {
 		wg.Add(1)
 		go beneWorker(i, queue, dupChan, db, logger, dupCounter)
 	}
@@ -413,6 +434,33 @@ func main() {
 	// custom error logger with date and time
 	logger := log.New(os.Stderr, "", log.Ldate|log.Ltime)
 
+	// load app settings from environment
+	var cfg Config
+	err := envconfig.Process("BH_", &cfg)
+	if err != nil {
+		logger.Fatal(err)
+	}
+
+	// test hashing function
+	fmt.Println("testing hashing function.")
+	var testCfg Config
+	testCfg.MbiHashIterations = 1000
+	testCfg.MbiHashLength = 32
+	testCfg.MbiHashPepper = hex.EncodeToString([]byte("nottherealpepper"))
+	t1Start := time.Now()
+	t1 := testHash("123456789A", "d95a418b0942c7910fb1d0e84f900fe12e5a7fd74f312fa10730cc0fda230e9a", &testCfg)
+	t1Duration := time.Since(t1Start)
+	t2Start := time.Now()
+	t2 := testHash("987654321E", "6357f16ebd305103cf9f2864c56435ad0de5e50f73631159772f4a4fcdfe39a5", &testCfg)
+	t2Duration := time.Since(t2Start)
+	if !t1 || !t2 {
+		logger.Fatal("error testing hashing function")
+	}
+	var hashCost time.Duration
+	hashCost = ((t1Duration + t2Duration) / 2)
+	hashPerMil := hashCost * 1000000
+	fmt.Printf("mbi hashing will add ~ %v seconds per bene (around %v per million)\n", hashCost.Seconds(), fmt.Sprintf("%s", hashPerMil))
+
 	// parse flags
 	buildQueueFlag := flag.Bool("build-queue", false, "build the queue")
 	processQueueFlag := flag.Bool("process-queue", false, "process the queue (delete dups)")
@@ -423,12 +471,6 @@ func main() {
 		fmt.Println("nothing to do.")
 		flag.Usage()
 		os.Exit(1)
-	}
-
-	var cfg Config
-	err := envconfig.Process("BH_", &cfg)
-	if err != nil {
-		logger.Fatal(err)
 	}
 
 	// we are using badger db (a fast embedded kv store) for serializing our very large queue of benes
