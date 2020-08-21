@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -17,27 +18,31 @@ import (
 	"github.com/elastic/gosigar"
 	"github.com/kelseyhightower/envconfig"
 	_ "github.com/lib/pq"
+	"golang.org/x/crypto/pbkdf2"
 	"golang.org/x/text/message"
 )
 
 // Config is loaded from environment. See .env file
 type Config struct {
-	RoDbHost         string `envconfig:"BH_RO_DB_HOST"`
-	RoDbPort         int    `envconfig:"BH_RO_DB_PORT"`
-	RoDbUser         string `envconfig:"BH_RO_DB_USER"`
-	RoDbPassword     string `envconfig:"BH_RO_DB_PASSWORD"`
-	RwDbHost         string `envconfig:"BH_RW_DB_HOST"`
-	RwDbPort         int    `envconfig:"BH_RW_DB_PORT"`
-	RwDbUser         string `envconfig:"BH_RW_DB_USER"`
-	RwDbPassword     string `envconfig:"BH_RW_DB_PASSWORD"`
-	DbName           string `envconfig:"BH_DB_NAME"`
-	HistoryTableName string `envconfig:"BH_DB_HISTORY_TABLE_NAME"`
-	HistoryTableRows uint64 `envconfig:"BH_DB_HISTORY_TABLE_ROWS"`
-	NumQueueWorkers  int    `envconfig:"BH_NUM_QUEUE_WORKERS"`
-	QueueFeedLimit   uint64 `envconfig:"BH_QUEUE_FEED_LIMIT"`
-	QueueBuffer      uint64 `envconfig:"BH_QUEUE_BUFFER"`
-	NumDupWorkers    int    `envconfig:"BH_NUM_DUP_WORKERS"`
-	DupBuffer        int    `envconfig:"BH_DUP_BUFFER"`
+	RoDbHost          string `envconfig:"BH_RO_DB_HOST"`
+	RoDbPort          int    `envconfig:"BH_RO_DB_PORT"`
+	RoDbUser          string `envconfig:"BH_RO_DB_USER"`
+	RoDbPassword      string `envconfig:"BH_RO_DB_PASSWORD"`
+	RwDbHost          string `envconfig:"BH_RW_DB_HOST"`
+	RwDbPort          int    `envconfig:"BH_RW_DB_PORT"`
+	RwDbUser          string `envconfig:"BH_RW_DB_USER"`
+	RwDbPassword      string `envconfig:"BH_RW_DB_PASSWORD"`
+	DbName            string `envconfig:"BH_DB_NAME"`
+	HistoryTableName  string `envconfig:"BH_DB_HISTORY_TABLE_NAME"`
+	HistoryTableRows  uint64 `envconfig:"BH_DB_HISTORY_TABLE_ROWS"`
+	NumQueueWorkers   int    `envconfig:"BH_NUM_QUEUE_WORKERS"`
+	QueueFeedLimit    uint64 `envconfig:"BH_QUEUE_FEED_LIMIT"`
+	QueueBuffer       uint64 `envconfig:"BH_QUEUE_BUFFER"`
+	NumbeneWorkers    int    `envconfig:"BH_NUM_DUP_WORKERS"`
+	DupBuffer         int    `envconfig:"BH_DUP_BUFFER"`
+	MbiHashPepper     string `envconfig:"BH_MBI_HASH_PEPPER"`
+	MbiHashIterations int    `envconfig:"BH_MBI_HASH_ITERATIONS"`
+	MbiHashLength     int    `envconfig:"BH_MBI_HASH_LENGTH"`
 }
 
 // queueBatch represents the sql our queue workers will process to find unique bene id's
@@ -52,7 +57,7 @@ type queueBatch struct {
 // tuning defaults
 const (
 	numQueueWorkersDefault = 3  // number of workers adding benes to the queue. (keep this small)
-	numDupWorkersDefault   = 16 // number of workers running delete from queries
+	numbeneWorkersDefault  = 16 // number of workers running delete from queries
 )
 
 // queue query pattern
@@ -147,6 +152,12 @@ func badgerCloseHandler(queue *badger.DB) {
 			os.Exit(0)
 		}
 	}()
+}
+
+// hashes mbi using PBKDF2-HMAC-SHA256 (see .env) and sets *mbiHash to the result
+func mbiHash(mbiHash *string, mbi []byte, cfg *Config) {
+	tmp := pbkdf2.Key(mbi, []byte(cfg.MbiHashPepper), cfg.MbiHashIterations, cfg.MbiHashLength, sha256.New)
+	*mbiHash = fmt.Sprintf("%x", string(tmp))
 }
 
 // searches the history table for unique benes to add to the queue
@@ -292,7 +303,7 @@ func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger, processQueueF
 	}
 }
 
-func dupWorker(id int, queue *badger.DB, dupChan <-chan *badger.Item, db *sql.DB, logger *log.Logger, dupCounter *uint64) {
+func beneWorker(id int, queue *badger.DB, dupChan <-chan *badger.Item, db *sql.DB, logger *log.Logger, dupCounter *uint64) {
 	for bene := range dupChan {
 		bene := bene
 		beneid := bene.Key()
@@ -313,7 +324,7 @@ func dupWorker(id int, queue *badger.DB, dupChan <-chan *badger.Item, db *sql.DB
 			continue
 		}
 
-		// else, delete the dups and mark them as completed
+		// else, delete dups
 		result, err := db.Exec(deletePattern, beneid)
 		if err != nil {
 			logger.Fatal(err)
@@ -322,6 +333,8 @@ func dupWorker(id int, queue *badger.DB, dupChan <-chan *badger.Item, db *sql.DB
 		if err != nil {
 			logger.Fatal(err)
 		}
+
+		// TODO: update mbi hash
 
 		// mark as completed
 		badgerWrite(queue, beneid, []byte("1"))
@@ -354,11 +367,11 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupCounter 
 	fmt.Printf("connected to %v.\n", cfg.RwDbHost)
 
 	// determine how many workers to use
-	var numDupWorkers int
+	var numbeneWorkers int
 	if cfg.NumQueueWorkers > 0 {
-		numDupWorkers = cfg.NumDupWorkers
+		numbeneWorkers = cfg.NumbeneWorkers
 	} else {
-		numDupWorkers = runtime.NumCPU()
+		numbeneWorkers = runtime.NumCPU()
 	}
 
 	// set buffer value
@@ -373,9 +386,9 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupCounter 
 	var dupChan = make(chan *badger.Item, dupBuffer)
 	var wg sync.WaitGroup
 	var i int
-	for i = 0; i < numDupWorkers; i++ {
+	for i = 0; i < numbeneWorkers; i++ {
 		wg.Add(1)
-		go dupWorker(i, queue, dupChan, db, logger, dupCounter)
+		go beneWorker(i, queue, dupChan, db, logger, dupCounter)
 	}
 
 	// loop through all the keys in the queue, sending them to be processed by the dup worker
@@ -412,7 +425,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// load our settings from env vars
 	var cfg Config
 	err := envconfig.Process("BH_", &cfg)
 	if err != nil {
