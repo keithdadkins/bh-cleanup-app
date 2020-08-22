@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
@@ -39,8 +40,8 @@ type Config struct {
 	NumQueueWorkers   int    `envconfig:"BH_NUM_QUEUE_WORKERS"`
 	QueueFeedLimit    uint64 `envconfig:"BH_QUEUE_FEED_LIMIT"`
 	QueueBuffer       uint64 `envconfig:"BH_QUEUE_BUFFER"`
-	numBeneWorkers    int    `envconfig:"BH_NUM_DUP_WORKERS"`
-	DupBuffer         int    `envconfig:"BH_DUP_BUFFER"`
+	NumBeneWorkers    int    `envconfig:"BH_NUM_BENE_WORKERS"`
+	BeneWorkerBuffer  int    `envconfig:"BH_BENE_WORKER_BUFFER"`
 	MbiHashPepper     string `envconfig:"BH_MBI_HASH_PEPPER"`
 	MbiHashIterations int    `envconfig:"BH_MBI_HASH_ITERATIONS"`
 	MbiHashLength     int    `envconfig:"BH_MBI_HASH_LENGTH"`
@@ -366,7 +367,16 @@ func beneWorker(id int, queue *badger.DB, dupChan <-chan *badger.Item, db *sql.D
 			fmt.Printf("%v duplicates deleted\n", *dupCounter)
 		}
 
-		logger.Printf("processed bene %v\n", string(beneid))
+		// back off if low on free mem
+		mem := freeMem()
+		if bToMb(mem.ActualFree) < 128 {
+			// force garbage collection and sleep for a few seconds
+			runtime.GC()
+			logger.Println("backing off due to low memory")
+			time.Sleep(time.Duration(rand.Intn(60)) * time.Second)
+		}
+
+		// logger.Printf("processed bene %v\n", string(beneid))
 	}
 }
 
@@ -390,20 +400,21 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupCounter 
 	// determine how many workers to use
 	var numBeneWorkers int
 	if cfg.NumQueueWorkers > 0 {
-		numBeneWorkers = cfg.numBeneWorkers
+		numBeneWorkers = cfg.NumBeneWorkers
 	} else {
 		numBeneWorkers = runtime.NumCPU()
 	}
 
 	// set buffer value
 	var dupBuffer int
-	if cfg.DupBuffer > 1 {
-		dupBuffer = cfg.DupBuffer
+	if cfg.BeneWorkerBuffer > 1 {
+		dupBuffer = cfg.BeneWorkerBuffer
 	} else {
 		dupBuffer = 1
 	}
 
 	// spin up the workers
+	fmt.Printf("spawning %v cleanup workers.\n", numBeneWorkers)
 	var dupChan = make(chan *badger.Item, dupBuffer)
 	var wg sync.WaitGroup
 	var i int
@@ -412,15 +423,17 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupCounter 
 		go beneWorker(i, queue, dupChan, db, logger, dupCounter)
 	}
 
-	// loop through all the keys in the queue, sending them to be processed by the dup worker
+	// loop through all the keys and send incompletes to workers for processing
 	err = queue.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
-			bene := it.Item()
-			dupChan <- bene
+			if it.Item().ValueSize() > 0 {
+				bene := it.Item()
+				dupChan <- bene
+			}
 		}
 		return nil
 	})
