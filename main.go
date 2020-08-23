@@ -61,8 +61,12 @@ type queueBatch struct {
 // default number of workers adding benes to the queue. (keep this small to reduce lock contention in badger)
 const numQueueWorkersDefault = 3
 
+// row count pattern
+// const rowCountPattern = `SELECT reltuples::bigint AS ct FROM pg_class WHERE oid = 'public.\"BeneficiariesHistory\"'::regclass;`
+const rowCountPattern = `SELECT count(*)  FROM "BeneficiariesHistory";`
+
 // queue query pattern
-const queuePattern = "SELECT \"beneficiaryId\" FROM \"BeneficiariesHistory\" OFFSET $1 LIMIT $2 ;"
+const queuePattern = `SELECT "beneficiaryId" FROM "BeneficiariesHistory" OFFSET $1 LIMIT $2 ;`
 
 // delete query pattern
 const deletePattern = `WITH x AS (SELECT "beneficiaryHistoryId" FROM (SELECT
@@ -84,10 +88,10 @@ WHERE
 WHERE dups.row > 1)
 DELETE FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "beneficiaryHistoryId" IN (SELECT "beneficiaryHistoryId" FROM x)`
 
-// mbi hash select pattern
-const mbiHashSelector = `SELECT "beneficiaryHistoryId" FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL`
+// missing mbi hash pattern
+const missingMbiPattern = `SELECT "beneficiaryHistoryId", "medicareBeneficiaryId" FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL`
 
-// mbi hash update pattern
+// update missing hash pattern
 const updateHashPattern = `UPDATE "BeneficiariesHistory" SET "mbiHash" = $1 WHERE "beneficiaryHistoryId" = $2`
 
 // gets the current amount of "actual" free memory.
@@ -147,6 +151,7 @@ func badgerCheck(b *badger.DB, k []byte) (bool, error) {
 	return true, nil
 }
 
+// trap ctl-c, kill, etc and try to gracefully close badger
 func badgerCloseHandler(queue *badger.DB) {
 	c := make(chan os.Signal)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
@@ -185,7 +190,7 @@ func testHash(testmbi string, expected string, cfg *Config) bool {
 }
 
 // searches the history table for unique benes to add to the queue
-func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatch, wg *sync.WaitGroup, logger *log.Logger, rowsLeft *uint64, feedLimit uint64) {
+func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatch, wg *sync.WaitGroup, logger *log.Logger, rowsLeft *uint64, feedLimit uint64, batchDoneChan chan<- bool) {
 
 	// poll the channel for batches to process
 	for qry := range batches {
@@ -195,12 +200,12 @@ func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatc
 		// execute the batch query
 		rows, err := db.Query(queuePattern, qry.Offset, qry.Limit)
 		if err != nil {
-			log.Fatal(err)
+			logger.Fatal(err)
 		}
 
 		// parse the results
-		var benecount int32
-		var skipcount int32
+		// var benecount int32
+		// var skipcount int32
 		for rows.Next() {
 			var beneid string
 			_ = rows.Scan(&beneid)
@@ -212,9 +217,9 @@ func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatc
 				if added != true {
 					logger.Fatal(err)
 				}
-				benecount++
-			} else {
-				skipcount++
+				// 	benecount++
+				// } else {
+				// 	skipcount++
 			}
 		}
 
@@ -223,19 +228,21 @@ func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatc
 		*rowsLeft -= feedLimit
 
 		// log the current memory stats after each batch
-		mem := freeMem()
-		fmt.Printf("added %v benes - current mem used (MB): %v mem free (MB): %v\n", benecount, bToMb(mem.ActualUsed), bToMb(mem.ActualFree))
+		// mem := freeMem()
+
+		// fmt.Printf("added %v benes to the queue - current mem used (MB): %v mem free (MB): %v\n", benecount, bToMb(mem.ActualUsed), bToMb(mem.ActualFree))
+		batchDoneChan <- true
 
 		// admin
-		queue.Sync() // sync badger to disk after each batch
-		runtime.GC() // force garbage collection
+		// queue.Sync() // sync badger to disk after each batch
+		// runtime.GC() // force garbage collection
 
 		// back off if needed
-		mem = freeMem()
-		if bToMb(mem.ActualFree) < 512 {
-			logger.Println("backing off due to low memory")
-			time.Sleep(time.Minute)
-		}
+		// mem := freeMem()
+		// if bToMb(mem.ActualFree) < 512 {
+		// 	logger.Println("backing off due to low memory..")
+		// 	time.Sleep(time.Minute)
+		// }
 	}
 
 	// when there no more batches to process, close this worker
@@ -243,7 +250,7 @@ func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatc
 }
 
 // builds (or continues building) the queue of bene id's
-func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger) {
+func buildQueue(id int, queue *badger.DB, cfg *Config, logger *log.Logger) {
 	// postgres - (use reader db settings)
 	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable", cfg.RoDbHost, cfg.RoDbPort, cfg.RoDbUser, cfg.RoDbPassword, cfg.DbName)
 	db, err := sql.Open("postgres", psqlInfo)
@@ -265,8 +272,8 @@ func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger) {
 		// row count was manually set, use it
 		bhRowCount = cfg.HistoryTableRows
 	} else {
-		// grab an estimated row count (doing a 'select count(*) from' query on the history table can take 25 minutes or more to run)
-		row := db.QueryRow("SELECT reltuples::bigint AS ct FROM pg_class WHERE oid = 'public.\"BeneficiariesHistory\"'::regclass;")
+		// get the row count
+		row := db.QueryRow(rowCountPattern)
 		if err := row.Scan(&bhRowCount); err != nil {
 			logger.Fatal(err)
 		}
@@ -296,14 +303,35 @@ func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger) {
 		numQueueWorkers = runtime.NumCPU()
 	}
 
+	// progress bar
+	numBatches := bhRowCount / feedLimit
+	count := int(numBatches)
+	bar := pb.New(count)
+	batchDoneChan := make(chan bool)
+	barStart := false
+	bar.ShowPercent = true
+	bar.ShowBar = true
+	bar.ShowCounters = false
+	bar.ShowTimeLeft = true
+	go func() {
+		for <-batchDoneChan {
+			if barStart {
+				bar.Increment()
+			} else {
+				bar.Start()
+				barStart = true
+			}
+		}
+	}()
+
 	// spin up the workers
 	var queueChan = make(chan *queueBatch, cfg.QueueBuffer)
-	fmt.Println("preparing workers.")
+	logger.Printf("launching %v workers.\n", numQueueWorkers)
 	var wg sync.WaitGroup
 	var i int
 	for i = 0; i < numQueueWorkers; i++ {
 		wg.Add(1)
-		go queueWorker(i, db, queue, queueChan, &wg, logger, &rowsLeft, feedLimit)
+		go queueWorker(i, db, queue, queueChan, &wg, logger, &rowsLeft, feedLimit, batchDoneChan)
 	}
 
 	// send workers batches to process
@@ -318,14 +346,15 @@ func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger) {
 
 	// wait for the workers to finish
 	wg.Wait()
+	bar.FinishPrint("complete.")
 }
 
-func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.DB, logger *log.Logger, beneDoneChan chan<- bool) {
+func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.DB, logger *log.Logger, cfg *Config, beneDoneChan chan<- bool) {
 	for bene := range beneChan {
 		bene := bene
 		beneid := bene.Key()
 
-		// check if we have already processed this bene
+		// check if we have already processed this bene, skip if so
 		completed := false
 		if err := bene.Value(func(v []byte) error {
 			if len(v) > 0 {
@@ -335,31 +364,59 @@ func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *s
 		}); err != nil {
 			logger.Fatal(err)
 		}
-
-		// skip if we have
 		if completed == true {
 			continue
 		}
 
-		// else, delete dups
+		// delete dups
 		_, err := db.Exec(deletePattern, beneid)
 		if err != nil {
 			logger.Fatal(err)
 		}
 
-		// TODO: update mbi hash
+		// check for missing mbi hashes
+		rows, err := db.Query(missingMbiPattern, beneid)
+		if err != nil {
+			logger.Fatal(err)
+		}
+		for rows.Next() {
+			var beneHistoryID string
+			var mbi string
+			_ = rows.Scan(&beneHistoryID, &mbi)
 
-		// mark as completed
-		ok, _ := badgerWrite(queue, beneid, []byte("1"))
-		if ok {
-			logger.Println(beneid)
-			beneDoneChan <- true
-		} else {
-			logger.Println("error updating ", beneid)
+			// make sure there is an mbi to hash
+			if len(mbi) < 1 {
+				logger.Printf("ERROR - bene %v has no medicareBeneficiaryId to hash.\n", beneid)
+				continue
+			}
+
+			// hash the mbi
+			var mbiHash string
+			if err := hashMBI([]byte(mbi), &mbiHash, cfg); err != nil {
+				logger.Fatal("error hashing mbi for bene ", beneid)
+			}
+
+			// update the row
+			results, err := db.Exec(updateHashPattern, mbiHash, beneHistoryID)
+			if err != nil {
+				logger.Fatal(err)
+			}
+			rowsEffected, _ := results.RowsAffected()
+			if rowsEffected < 1 {
+				logger.Fatal(err)
+			}
 		}
 
-		// update stats
-		// atomic.AddUint64(doneCounter, 1)
+		// close the rows when done
+		if err := rows.Close(); err != nil {
+			logger.Fatal(err)
+		}
+
+		// mark bene as completed
+		ok, _ := badgerWrite(queue, beneid, []byte("1"))
+		if ok {
+			beneDoneChan <- true
+		}
 
 		// back off if low on free mem
 		mem := freeMem()
@@ -370,11 +427,12 @@ func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *s
 			time.Sleep(time.Duration(rand.Intn(60)) * time.Second)
 		}
 
-		// logger.Printf("processed bene %v\n", string(beneid))
+		// log it
+		// logger.Printf("fin %v\n", string(beneid))
 	}
 }
 
-// manages the processing of the queue (deleting duplicates, updating badger, etc)
+// runs cleanup workers for each bene in the queue
 func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, beneDoneChan chan<- bool) {
 
 	// postgres - (use reader db settings)
@@ -414,7 +472,7 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, beneDoneCha
 	var i int
 	for i = 0; i < numCleanupWorkers; i++ {
 		wg.Add(1)
-		go cleanupWorker(i, queue, beneChan, db, logger, beneDoneChan)
+		go cleanupWorker(i, queue, beneChan, db, logger, cfg, beneDoneChan)
 	}
 
 	// loop through all the keys and send incompletes to workers for processing
@@ -449,6 +507,18 @@ func main() {
 		logger.Fatal(err)
 	}
 
+	// parse flags
+	buildQueueFlag := flag.Bool("build-queue", false, "build the queue")
+	processQueueFlag := flag.Bool("process-queue", false, "process the queue")
+	flag.Parse()
+
+	// exit if no flag was set
+	if *buildQueueFlag != true && *processQueueFlag != true {
+		fmt.Println("nothing to do.")
+		flag.Usage()
+		os.Exit(1)
+	}
+
 	// test hashing function
 	fmt.Println("testing hashing function.")
 	var testCfg Config
@@ -467,19 +537,7 @@ func main() {
 	var hashCost time.Duration
 	hashCost = ((t1Duration + t2Duration) / 2)
 	hashPerMil := hashCost * 1000000
-	fmt.Printf("mbi hashing will add ~ %v seconds per bene (around %v per million)\n", hashCost.Seconds(), fmt.Sprintf("%s", hashPerMil))
-
-	// parse flags
-	buildQueueFlag := flag.Bool("build-queue", false, "build the queue")
-	processQueueFlag := flag.Bool("process-queue", false, "process the queue (delete dups)")
-	flag.Parse()
-
-	// exit if no flag was set
-	if *buildQueueFlag != true && *processQueueFlag != true {
-		fmt.Println("nothing to do.")
-		flag.Usage()
-		os.Exit(1)
-	}
+	fmt.Printf("mbi hashing will add ~ %v seconds per bene to process (around %v per million)\n", hashCost.Seconds(), fmt.Sprintf("%s", hashPerMil))
 
 	// badger steals stdout/err breaking progress bars.. let's prevent that by passing it a pipe instead
 	oldStdout := os.Stdout
@@ -489,6 +547,7 @@ func main() {
 	}
 	os.Stdout = w
 
+	// send stdout to buffer
 	stdOutChan := make(chan string)
 	go func() {
 		var buf bytes.Buffer
@@ -496,7 +555,8 @@ func main() {
 		stdOutChan <- buf.String()
 	}()
 
-	queue, err := badger.Open(badger.DefaultOptions("dup.queue"))
+	// open badger db
+	queue, err := badger.Open(badger.DefaultOptions("cleanup.queue"))
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -506,7 +566,7 @@ func main() {
 	// close the pipe and go back to normal stdout. badger really only writes to stderr anyway.
 	w.Close()
 	os.Stdout = oldStdout
-	<-stdOutChan //just ignore
+	<-stdOutChan //so just ignore
 
 	// build the queue
 	if *buildQueueFlag {
@@ -543,7 +603,7 @@ func main() {
 	barStart := false
 	bar.ShowPercent = true
 	bar.ShowBar = true
-	bar.ShowCounters = true
+	bar.ShowCounters = false
 	bar.ShowTimeLeft = true
 	go func() {
 		for <-beneDoneChan {

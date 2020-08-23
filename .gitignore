@@ -1,4 +1,4 @@
 bh-cleanup-app
 **log
-dup.queue*
+cleanup.queue*
 *.env
