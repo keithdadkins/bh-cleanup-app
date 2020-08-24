@@ -215,6 +215,7 @@ func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger) {
 		// get the row count
 		row := db.QueryRow(rowCountPattern)
 		if err := row.Scan(&beneRowCount); err != nil {
+			logger.Panicln("error getting bene row count")
 			logger.Fatal(err)
 		}
 	}
@@ -300,6 +301,7 @@ func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatc
 		// execute the batch query
 		rows, err := db.Query(queuePattern, qry.Offset, qry.Limit)
 		if err != nil {
+			logger.Println("error fetching query batch")
 			logger.Fatal(err)
 		}
 
@@ -382,6 +384,7 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, beneDoneCha
 		return nil
 	})
 	if err != nil {
+		logger.Println("error sending benes to cleanup")
 		logger.Fatal(err)
 	}
 	wg.Wait()
@@ -400,6 +403,7 @@ func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *s
 			}
 			return nil
 		}); err != nil {
+			logger.Println("error fetching bene from badger - ", string(beneid))
 			logger.Fatal(err)
 		}
 		if completed == true {
@@ -409,13 +413,15 @@ func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *s
 		// delete any dups
 		_, err := db.Exec(deletePattern, beneid)
 		if err != nil {
+			logger.Println("error deleting dups for ", string(beneid))
 			logger.Fatal(err)
 		}
 		// result.RowsAffected() //if we want to track how many dups were deleted
 
 		// check for missing mbi hashes
-		rows, err := db.Query(missingMbiPattern, beneid)
+		rows, err := db.Query(missingMbiPattern, string(beneid))
 		if err != nil {
+			logger.Println("error querying missing mbi hashes for ", string(beneid))
 			logger.Fatal(err)
 		}
 		for rows.Next() {
@@ -426,23 +432,26 @@ func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *s
 			// hash the mbi
 			var mbiHash string
 			if err := hashMBI([]byte(mbi), &mbiHash, cfg); err != nil {
-				logger.Println("error hashing mbi for bene ", beneid)
+				logger.Printf("error hashing mbi for %v bh id %v\n", string(beneid), beneHistoryID)
 				logger.Fatal(err)
 			}
 
 			// update the row
 			results, err := db.Exec(updateHashPattern, mbiHash, beneHistoryID)
 			if err != nil {
+				logger.Printf("error executing query bene %v's bh history entry %v\n", string(beneid), beneHistoryID)
 				logger.Fatal(err)
 			}
 			rowsEffected, _ := results.RowsAffected()
-			if rowsEffected < 1 {
+			if rowsEffected != 1 {
+				logger.Printf("error updating bene %v's mbiHash", string(beneid))
 				logger.Fatal(err)
 			}
 		}
 
 		// close the rows when done
 		if err := rows.Close(); err != nil {
+			logger.Println("error closing rows after cleanup op")
 			logger.Fatal(err)
 		}
 
