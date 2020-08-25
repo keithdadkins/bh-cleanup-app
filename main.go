@@ -89,10 +89,11 @@ WHERE dups.row > 1)
 DELETE FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "beneficiaryHistoryId" IN (SELECT "beneficiaryHistoryId" FROM x)`
 
 // missing mbi hash pattern
-const missingMbiPattern = `SELECT "beneficiaryHistoryId", "medicareBeneficiaryId" FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL AND "beneficiaryHistoryId" IS NOT NULL`
+const missingMbiPattern = `SELECT "beneficiaryHistoryId", "medicareBeneficiaryId" FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL AND "medicareBeneficiaryId" IS NOT NULL`
+const missingMbiCountPattern = `SELECT count(*) FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL AND "medicareBeneficiaryId" IS NOT NULL`
 
 // update missing hash pattern
-const updateHashPattern = `UPDATE "BeneficiariesHistory" SET "mbiHash" = $1 WHERE "beneficiaryHistoryId" = $2`
+const updateHashPattern = `UPDATE "BeneficiariesHistory" SET "mbiHash" = $1 WHERE "beneficiaryId" = $2 AND "beneficiaryHistoryId" = $3`
 
 // gets the current amount of "actual" free memory.
 func freeMem() gosigar.Mem {
@@ -300,6 +301,7 @@ func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatc
 
 		// execute the batch query
 		rows, err := db.Query(queuePattern, qry.Offset, qry.Limit)
+		defer rows.Close()
 		if err != nil {
 			logger.Println("error fetching query batch")
 			logger.Fatal(err)
@@ -316,8 +318,6 @@ func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatc
 		}
 		txn.Commit()
 
-		// close the sql rows and update our progress
-		rows.Close()
 		*rowsLeft -= feedLimit
 		batchDoneChan <- true
 	}
@@ -411,48 +411,68 @@ func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *s
 		}
 
 		// delete any dups
-		_, err := db.Exec(deletePattern, beneid)
+		txn, err := db.Begin()
 		if err != nil {
+			fmt.Println("error connecting to db to delete dups")
+			logger.Fatal(err)
+		}
+		_, err = txn.Exec(deletePattern, beneid)
+		if err != nil {
+			txn.Rollback()
 			logger.Println("error deleting dups for ", string(beneid))
 			logger.Fatal(err)
 		}
-		// result.RowsAffected() //if we want to track how many dups were deleted
+		txn.Commit()
 
-		// check for missing mbi hashes
+		// check for missing mbi hashes, skip if none
+		var missingRowCount int
+		row := db.QueryRow(missingMbiCountPattern, string(beneid))
+		if err := row.Scan(&missingRowCount); err != nil {
+			fmt.Println("error fetching missing row count")
+			logger.Fatal(err)
+		}
+		if missingRowCount < 1 {
+			continue
+		}
+
+		// grab the records with missing hashes
 		rows, err := db.Query(missingMbiPattern, string(beneid))
+		defer rows.Close()
 		if err != nil {
 			logger.Println("error querying missing mbi hashes for ", string(beneid))
 			logger.Fatal(err)
 		}
+
 		for rows.Next() {
+			// hash the mbi
 			var beneHistoryID string
 			var mbi string
-			_ = rows.Scan(&beneHistoryID, &mbi)
-
-			// hash the mbi
 			var mbiHash string
+			rows.Scan(&beneHistoryID, &mbi)
 			if err := hashMBI([]byte(mbi), &mbiHash, cfg); err != nil {
 				logger.Printf("error hashing mbi for %v bh id %v\n", string(beneid), beneHistoryID)
 				logger.Fatal(err)
 			}
 
-			// update the row
-			results, err := db.Exec(updateHashPattern, mbiHash, beneHistoryID)
+			// update the record
+			txn, err := db.Begin()
 			if err != nil {
+				fmt.Println("error connecting to db to update mbi hash")
+				logger.Fatal(err)
+			}
+			results, err := txn.Exec(updateHashPattern, mbiHash, beneid, beneHistoryID)
+			if err != nil {
+				txn.Rollback()
 				logger.Printf("error executing query bene %v's bh history entry %v\n", string(beneid), beneHistoryID)
 				logger.Fatal(err)
 			}
-			rowsEffected, _ := results.RowsAffected()
-			if rowsEffected != 1 {
-				logger.Printf("error updating bene %v's mbiHash", string(beneid))
+			_, err = results.RowsAffected()
+			if err != nil {
+				fmt.Println("error getting RowsAffected")
+				txn.Rollback()
 				logger.Fatal(err)
 			}
-		}
-
-		// close the rows when done
-		if err := rows.Close(); err != nil {
-			logger.Println("error closing rows after cleanup op")
-			logger.Fatal(err)
+			txn.Commit()
 		}
 
 		// mark bene as completed
@@ -469,9 +489,6 @@ func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *s
 			logger.Println("backing off due to low memory")
 			time.Sleep(time.Duration(rand.Intn(60)) * time.Second)
 		}
-
-		// log it
-		// logger.Printf("fin %v\n", string(beneid))
 	}
 }
 
