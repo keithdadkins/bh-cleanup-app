@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
@@ -479,15 +478,6 @@ func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *s
 		ok, _ := badgerWrite(queue, beneid, []byte("1"))
 		if ok {
 			beneDoneChan <- true
-		}
-
-		// back off if low on free mem
-		mem := freeMem()
-		if bToMb(mem.ActualFree) < 128 {
-			// force garbage collection and sleep for a few seconds
-			runtime.GC()
-			logger.Println("backing off due to low memory")
-			time.Sleep(time.Duration(rand.Intn(60)) * time.Second)
 		}
 	}
 }
