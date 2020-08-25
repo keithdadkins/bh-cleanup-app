@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,8 +43,10 @@ type Config struct {
 	NumQueueWorkers   int    `envconfig:"BH_NUM_QUEUE_WORKERS"`
 	QueueFeedLimit    uint64 `envconfig:"BH_QUEUE_FEED_LIMIT"`
 	QueueBuffer       uint64 `envconfig:"BH_QUEUE_BUFFER"`
-	NumCleanupWorkers int    `envconfig:"BH_NUM_CLEANUP_WORKERS"`
-	CleanupBuffer     int    `envconfig:"BH_CLEANUP_BUFFER"`
+	NumDupWorkers     int    `envconfig:"BH_NUM_DUP_WORKERS"`
+	DupBuffer         int    `envconfig:"BH_DUP_BUFFER"`
+	NumMbiHashWorkers int    `envconfig:"BH_MBI_NUM_HASH_WORKERS"`
+	MbiHashBuffer     int    `envconfig:"BH_MBI_HASH_BUFFER"`
 	MbiHashPepper     string `envconfig:"BH_MBI_HASH_PEPPER"`
 	MbiHashIterations int    `envconfig:"BH_MBI_HASH_ITERATIONS"`
 	MbiHashLength     int    `envconfig:"BH_MBI_HASH_LENGTH"`
@@ -326,7 +329,7 @@ func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatc
 }
 
 // runs cleanup workers for each bene in the queue
-func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, beneDoneChan chan<- bool) {
+func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan chan<- bool) {
 
 	// postgres - (use reader db settings)
 	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable", cfg.RwDbHost, cfg.RwDbPort, cfg.RwDbUser, cfg.RwDbPassword, cfg.DbName)
@@ -342,33 +345,35 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, beneDoneCha
 	}
 	fmt.Printf("connected to %v.\n", cfg.RwDbHost)
 
-	// determine how many workers to use
-	var numCleanupWorkers int
-	if cfg.NumQueueWorkers > 0 {
-		numCleanupWorkers = cfg.NumCleanupWorkers
+	// determine how many dup workers to use
+	var numDupWorkers int
+	if cfg.NumDupWorkers > 0 {
+		numDupWorkers = cfg.NumDupWorkers
 	} else {
-		numCleanupWorkers = runtime.NumCPU()
+		numDupWorkers = runtime.NumCPU()
 	}
 
-	// set buffer value
-	var cleanupBuffer int
-	if cfg.CleanupBuffer > 1 {
-		cleanupBuffer = cfg.CleanupBuffer
+	// set dup buffer value
+	var dupBuffer int
+	if cfg.DupBuffer > 1 {
+		dupBuffer = cfg.DupBuffer
 	} else {
-		cleanupBuffer = 1
+		dupBuffer = 1
 	}
 
-	// launch the cleanup workers
-	fmt.Printf("spawning %v cleanup workers.\n", numCleanupWorkers)
-	var beneChan = make(chan *badger.Item, cleanupBuffer)
+	// launch the dup workers
+	var dupCounter uint64
+	fmt.Printf("spawning %v dup workers.\n", numDupWorkers)
+	var beneChan = make(chan *badger.Item, dupBuffer)
 	var wg sync.WaitGroup
 	var i int
-	for i = 0; i < numCleanupWorkers; i++ {
+	for i = 0; i < numDupWorkers; i++ {
 		wg.Add(1)
-		go cleanupWorker(i, queue, beneChan, db, logger, cfg, beneDoneChan)
+		go dupWorker(i, queue, beneChan, db, logger, cfg, dupDoneChan, &dupCounter)
 	}
 
-	// loop through all the keys and send incompletes to workers for processing
+	// loop through all the keys and send keys with no value to workers for processing
+	fmt.Println("processing dups.")
 	err = queue.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
@@ -376,28 +381,33 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, beneDoneCha
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
 			if !(it.Item().ValueSize() > 0) {
-				bene := it.Item()
-				beneChan <- bene
+				beneChan <- it.Item()
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		logger.Println("error sending benes to cleanup")
+		logger.Println("error processing dups")
 		logger.Fatal(err)
 	}
 	wg.Wait()
+	fmt.Printf("%v rows were deleted", dupCounter)
+	// check for missing mbi hashes
+
 }
 
-func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.DB, logger *log.Logger, cfg *Config, beneDoneChan chan<- bool) {
+func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.DB, logger *log.Logger, cfg *Config, dupDoneChan chan<- bool, dupCounter *uint64) {
 	for bene := range beneChan {
 		bene := bene
 		beneid := bene.Key()
 
-		// check if we have already processed this bene, skip if so
+		// check if completed.. skip if so
+		// 1 == dups, 2 == hashes, 3 == both
 		completed := false
+		var beneStatus string
 		if err := bene.Value(func(v []byte) error {
-			if len(v) > 0 {
+			beneStatus = string(v)
+			if beneStatus == "1" || beneStatus == "3" {
 				completed = true
 			}
 			return nil
@@ -409,78 +419,83 @@ func cleanupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *s
 			continue
 		}
 
-		// delete any dups
+		// delete dups
 		txn, err := db.Begin()
 		if err != nil {
 			fmt.Println("error connecting to db to delete dups")
 			logger.Fatal(err)
 		}
-		_, err = txn.Exec(deletePattern, beneid)
+		defer txn.Rollback()
+		result, err := txn.Exec(deletePattern, beneid)
+		rowsDeleted, _ := result.RowsAffected()
 		if err != nil {
-			txn.Rollback()
 			logger.Println("error deleting dups for ", string(beneid))
 			logger.Fatal(err)
 		}
 		txn.Commit()
 
-		// check for missing mbi hashes, skip if none
-		var missingRowCount int
-		row := db.QueryRow(missingMbiCountPattern, string(beneid))
-		if err := row.Scan(&missingRowCount); err != nil {
-			fmt.Println("error fetching missing row count")
-			logger.Fatal(err)
-		}
-		if missingRowCount < 1 {
-			continue
-		}
-
-		// grab the records with missing hashes
-		rows, err := db.Query(missingMbiPattern, string(beneid))
-		defer rows.Close()
-		if err != nil {
-			logger.Println("error querying missing mbi hashes for ", string(beneid))
-			logger.Fatal(err)
-		}
-
-		for rows.Next() {
-			// hash the mbi
-			var beneHistoryID string
-			var mbi string
-			var mbiHash string
-			rows.Scan(&beneHistoryID, &mbi)
-			if err := hashMBI([]byte(mbi), &mbiHash, cfg); err != nil {
-				logger.Printf("error hashing mbi for %v bh id %v\n", string(beneid), beneHistoryID)
-				logger.Fatal(err)
-			}
-
-			// update the record
-			txn, err := db.Begin()
-			if err != nil {
-				fmt.Println("error connecting to db to update mbi hash")
-				logger.Fatal(err)
-			}
-			results, err := txn.Exec(updateHashPattern, mbiHash, beneid, beneHistoryID)
-			if err != nil {
-				txn.Rollback()
-				logger.Printf("error executing query bene %v's bh history entry %v\n", string(beneid), beneHistoryID)
-				logger.Fatal(err)
-			}
-			_, err = results.RowsAffected()
-			if err != nil {
-				fmt.Println("error getting RowsAffected")
-				txn.Rollback()
-				logger.Fatal(err)
-			}
-			txn.Commit()
-		}
-
 		// mark bene as completed
 		ok, _ := badgerWrite(queue, beneid, []byte("1"))
 		if ok {
-			beneDoneChan <- true
+			atomic.AddUint64(dupCounter, uint64(rowsDeleted))
+			txn.Commit()
+			dupDoneChan <- true
+		} else {
+			txn.Rollback()
 		}
 	}
 }
+
+// func hashMissingMbi(db *sql.DB, logger *log.Logger) {
+
+// 	// look for missing hashes
+// 	txn, err = db.Begin()
+// 	if err != nil {
+// 		fmt.Printf("error beginning transaction")
+// 		logger.Fatal(err)
+// 	}
+// 	defer txn.Rollback()
+
+// 	// query
+// 	rows, err := txn.Query(missingMbiPattern, string(beneid))
+// 	if err != nil {
+// 		logger.Println("error querying missing mbi hashes for ", string(beneid))
+// 		logger.Fatal(err)
+// 	}
+
+// 	// parse results
+// 	var rowCounter int
+// 	for rows.Next() {
+// 		// hash the mbi
+// 		var beneHistoryID string
+// 		var mbi string
+// 		var mbiHash string
+// 		rows.Scan(&beneHistoryID, &mbi)
+// 		rows.Close() //weird bug
+// 		rowCounter++
+// 		if err := hashMBI([]byte(mbi), &mbiHash, cfg); err != nil {
+// 			logger.Printf("error hashing mbi for %v bh id %v\n", string(beneid), beneHistoryID)
+// 			logger.Fatal(err)
+// 		}
+
+// 		// update the record
+// 		_, err := txn.Exec(updateHashPattern, mbiHash, beneid, beneHistoryID)
+// 		if err != nil {
+// 			logger.Printf("error executing query bene %v's bh history entry %v\n", string(beneid), beneHistoryID)
+// 			logger.Fatal(err)
+// 		}
+// 	}
+
+// 	// mark bene as completed
+// 	fmt.Print(rowCounter)
+// 	ok, _ := badgerWrite(queue, beneid, []byte("1"))
+// 	if ok {
+// 		txn.Commit()
+// 		dupDoneChan <- true
+// 	} else {
+// 		txn.Rollback()
+// 	}
+// }
 
 func main() {
 
@@ -586,14 +601,14 @@ func main() {
 	// progress bar
 	count := int64(numBenesToProcess)
 	bar := pb.New64(count)
-	beneDoneChan := make(chan bool)
+	dupDoneChan := make(chan bool)
 	barStart := false
 	bar.ShowPercent = true
 	bar.ShowBar = true
 	bar.ShowCounters = false
 	bar.ShowTimeLeft = true
 	go func() {
-		for <-beneDoneChan {
+		for <-dupDoneChan {
 			if barStart {
 				bar.Increment()
 			} else {
@@ -606,7 +621,7 @@ func main() {
 	// process the queue
 	if *processQueueFlag == true {
 		fmt.Println("processing the queue.")
-		processQueue(queue, &cfg, logger, beneDoneChan)
+		processQueue(queue, &cfg, logger, dupDoneChan)
 	}
 	bar.FinishPrint("complete.")
 
