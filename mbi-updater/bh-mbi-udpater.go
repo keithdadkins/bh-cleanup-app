@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -13,12 +15,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/cheggaaa/pb"
 	badger "github.com/dgraph-io/badger/v2"
 	"github.com/elastic/gosigar"
 	"github.com/kelseyhightower/envconfig"
 	_ "github.com/lib/pq"
+	"golang.org/x/crypto/pbkdf2"
 	"golang.org/x/text/message"
 )
 
@@ -85,6 +89,13 @@ WHERE
 ) dups 
 WHERE dups.row > 1)
 DELETE FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "beneficiaryHistoryId" IN (SELECT "beneficiaryHistoryId" FROM x)`
+
+// missing mbi hash pattern
+const missingMbiPattern = `SELECT "beneficiaryHistoryId", "medicareBeneficiaryId" FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL AND "medicareBeneficiaryId" IS NOT NULL`
+const missingMbiCountPattern = `SELECT count(*) FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL AND "medicareBeneficiaryId" IS NOT NULL`
+
+// update missing hash pattern
+const updateHashPattern = `UPDATE "BeneficiariesHistory" SET "mbiHash" = $1 WHERE "beneficiaryId" = $2 AND "beneficiaryHistoryId" = $3`
 
 // gets the current amount of "actual" free memory.
 func freeMem() gosigar.Mem {
@@ -156,6 +167,29 @@ func badgerCloseHandler(queue *badger.DB) {
 			os.Exit(0)
 		}
 	}()
+}
+
+// hashes mbi using PBKDF2-HMAC-SHA256 and sets *hashedMBI to the result
+func hashMBI(mbi []byte, hashedMBI *string, cfg *Config) error {
+	// decode the pepper from hex
+	pepper, err := hex.DecodeString(cfg.MbiHashPepper)
+	if err != nil {
+		return err
+	}
+
+	// hash the mbi and set *hashedMbi to the result
+	tmp := pbkdf2.Key(mbi, pepper, cfg.MbiHashIterations, cfg.MbiHashLength, sha256.New)
+	*hashedMBI = fmt.Sprintf("%x", string(tmp))
+	return nil
+}
+
+// test hashing function
+func testHash(testmbi string, expected string, cfg *Config) bool {
+	beneMbi := []byte(testmbi)
+	var mbiHash string
+	hashMBI(beneMbi, &mbiHash, cfg)
+	result := mbiHash == expected
+	return result
 }
 
 // builds (or continues building) the queue of bene id's
@@ -358,6 +392,8 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan
 	}
 	wg.Wait()
 	fmt.Printf("%v rows were deleted", dupCounter)
+	// check for missing mbi hashes
+
 }
 
 func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.DB, logger *log.Logger, cfg *Config, dupDoneChan chan<- bool, dupCounter *uint64) {
@@ -410,6 +446,57 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.D
 	}
 }
 
+// func hashMissingMbi(db *sql.DB, logger *log.Logger) {
+
+// 	// look for missing hashes
+// 	txn, err = db.Begin()
+// 	if err != nil {
+// 		fmt.Printf("error beginning transaction")
+// 		logger.Fatal(err)
+// 	}
+// 	defer txn.Rollback()
+
+// 	// query
+// 	rows, err := txn.Query(missingMbiPattern, string(beneid))
+// 	if err != nil {
+// 		logger.Println("error querying missing mbi hashes for ", string(beneid))
+// 		logger.Fatal(err)
+// 	}
+
+// 	// parse results
+// 	var rowCounter int
+// 	for rows.Next() {
+// 		// hash the mbi
+// 		var beneHistoryID string
+// 		var mbi string
+// 		var mbiHash string
+// 		rows.Scan(&beneHistoryID, &mbi)
+// 		rows.Close() //weird bug
+// 		rowCounter++
+// 		if err := hashMBI([]byte(mbi), &mbiHash, cfg); err != nil {
+// 			logger.Printf("error hashing mbi for %v bh id %v\n", string(beneid), beneHistoryID)
+// 			logger.Fatal(err)
+// 		}
+
+// 		// update the record
+// 		_, err := txn.Exec(updateHashPattern, mbiHash, beneid, beneHistoryID)
+// 		if err != nil {
+// 			logger.Printf("error executing query bene %v's bh history entry %v\n", string(beneid), beneHistoryID)
+// 			logger.Fatal(err)
+// 		}
+// 	}
+
+// 	// mark bene as completed
+// 	fmt.Print(rowCounter)
+// 	ok, _ := badgerWrite(queue, beneid, []byte("1"))
+// 	if ok {
+// 		txn.Commit()
+// 		dupDoneChan <- true
+// 	} else {
+// 		txn.Rollback()
+// 	}
+// }
+
 func main() {
 
 	// custom error logger with date and time
@@ -433,6 +520,26 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+
+	// test hashing function
+	fmt.Println("testing hashing function.")
+	var testCfg Config
+	testCfg.MbiHashIterations = 1000
+	testCfg.MbiHashLength = 32
+	testCfg.MbiHashPepper = hex.EncodeToString([]byte("nottherealpepper"))
+	t1Start := time.Now()
+	t1 := testHash("123456789A", "d95a418b0942c7910fb1d0e84f900fe12e5a7fd74f312fa10730cc0fda230e9a", &testCfg)
+	t1Duration := time.Since(t1Start)
+	t2Start := time.Now()
+	t2 := testHash("987654321E", "6357f16ebd305103cf9f2864c56435ad0de5e50f73631159772f4a4fcdfe39a5", &testCfg)
+	t2Duration := time.Since(t2Start)
+	if !t1 || !t2 {
+		logger.Fatal("error testing hashing function")
+	}
+	var hashCost time.Duration
+	hashCost = ((t1Duration + t2Duration) / 2)
+	hashPerMil := hashCost * 1000000
+	fmt.Printf("mbi hashing will add ~ %v seconds per bene to process (around %v per million)\n", hashCost.Seconds(), fmt.Sprintf("%s", hashPerMil))
 
 	// badger steals stdout/err breaking progress bars.. let's prevent that by passing it a pipe instead
 	oldStdout := os.Stdout
@@ -513,7 +620,7 @@ func main() {
 
 	// process the queue
 	if *processQueueFlag == true {
-		fmt.Println("processing the queue for duplicates.")
+		fmt.Println("processing the queue.")
 		processQueue(queue, &cfg, logger, dupDoneChan)
 	}
 	bar.FinishPrint("complete.")
