@@ -256,12 +256,13 @@ func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger) {
 
 	// wait for the workers to finish
 	wg.Wait()
+	bar.Set(count)
 	bar.FinishPrint("complete.")
+	os.Exit(0)
 }
 
 // searches the history table for unique benes to add to the queue
 func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatch, wg *sync.WaitGroup, logger *log.Logger, rowsLeft *uint64, feedLimit uint64, batchDoneChan chan<- bool) {
-
 	// poll the channel for batches to process
 	for qry := range batches {
 		// create new instance of qry to ensure it's unique in each goroutine
@@ -269,28 +270,25 @@ func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatc
 
 		// execute the batch query
 		rows, err := db.Query(queuePattern, qry.Offset, qry.Limit)
-		defer rows.Close()
 		if err != nil {
 			logger.Println("error fetching query batch")
 			logger.Fatal(err)
 		}
 
-		txn := queue.NewTransaction(true)
-		defer txn.Discard()
-
 		// parse the results
 		for rows.Next() {
 			var beneid string
 			_ = rows.Scan(&beneid)
-			_ = txn.Set([]byte(beneid), nil)
+			ok, err := badgerWrite(queue, []byte(beneid), nil)
+			if ok != true {
+				logger.Println("could not write to badger db")
+				logger.Fatal(err)
+			}
 		}
-		txn.Commit()
-
+		rows.Close()
 		*rowsLeft -= feedLimit
 		batchDoneChan <- true
 	}
-
-	// when there no more batches to process, close this worker
 	wg.Done()
 }
 
@@ -335,18 +333,26 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan
 	var i int
 	for i = 0; i < numDupWorkers; i++ {
 		wg.Add(1)
-		go dupWorker(i, queue, beneChan, db, logger, cfg, dupDoneChan, &dupCounter)
+		go dupWorker(i, queue, beneChan, db, logger, cfg, dupDoneChan, &dupCounter, &wg)
 	}
 
-	// loop through all the keys and send keys with no value to workers for processing
+	// loop through all the keys
 	fmt.Println("processing dups.")
+	queue.PrintHistogram(nil)
 	err = queue.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
-			if !(it.Item().ValueSize() > 0) {
+			var status []byte
+			err := badgerRead(queue, it.Item().Key(), status)
+			if err != nil {
+				logger.Fatal(err)
+			}
+			if string(status) == "3" {
+				continue
+			} else {
 				beneChan <- it.Item()
 			}
 		}
@@ -356,11 +362,13 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan
 		logger.Println("error processing dups")
 		logger.Fatal(err)
 	}
+	close(beneChan)
 	wg.Wait()
 	fmt.Printf("%v rows were deleted", dupCounter)
 }
 
-func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.DB, logger *log.Logger, cfg *Config, dupDoneChan chan<- bool, dupCounter *uint64) {
+func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.DB, logger *log.Logger, cfg *Config, dupDoneChan chan<- bool, dupCounter *uint64, wg *sync.WaitGroup) {
+	defer wg.Done()
 	for bene := range beneChan {
 		bene := bene
 		beneid := bene.Key()
@@ -477,7 +485,12 @@ func main() {
 		it := txn.NewIterator(opts)
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
-			if it.Item().ValueSize() > 0 {
+			var status []byte
+			err := badgerRead(queue, it.Item().Key(), status)
+			if err != nil {
+				logger.Fatal(err)
+			}
+			if string(status) == "1" || string(status) == "3" {
 				doneCount++
 			}
 			qCount++
@@ -517,5 +530,4 @@ func main() {
 		processQueue(queue, &cfg, logger, dupDoneChan)
 	}
 	bar.FinishPrint("complete.")
-
 }
