@@ -2,12 +2,11 @@ package main
 
 import (
 	"bytes"
-	"database/sql"
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
@@ -19,8 +18,8 @@ import (
 	"github.com/cheggaaa/pb"
 	badger "github.com/dgraph-io/badger/v2"
 	"github.com/elastic/gosigar"
+	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/kelseyhightower/envconfig"
-	_ "github.com/lib/pq"
 	"golang.org/x/text/message"
 )
 
@@ -199,20 +198,12 @@ func badgerCloseHandler(queue *badger.DB, dupCounter *uint64) {
 
 // builds (or continues building) the queue of bene id's
 func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger) {
-	// postgres - (use reader db settings)
-	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable connect_timeout=5", cfg.RoDbHost, cfg.RoDbPort, cfg.RoDbUser, cfg.RoDbPassword, cfg.DbName)
-	db, err := sql.Open("postgres", psqlInfo)
+	psqlInfo := fmt.Sprintf("postgres://%s:%s@%s:%d/%s", cfg.RwDbUser, cfg.RwDbPassword, cfg.RwDbHost, cfg.RwDbPort, cfg.DbName)
+	db, err := pgxpool.Connect(context.Background(), psqlInfo)
 	if err != nil {
 		logger.Fatal(err)
 	}
 	defer db.Close()
-
-	// test the connection
-	if err = db.Ping(); err != nil {
-		logger.Fatal(err)
-	}
-	fmt.Printf("connected to %v.\n", cfg.RoDbHost)
-	fmt.Println("building the queue.")
 
 	// get number of benes we are processing
 	var beneRowCount uint64
@@ -221,7 +212,7 @@ func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger) {
 		beneRowCount = cfg.BeneTableRows
 	} else {
 		// get the row count
-		row := db.QueryRow(rowCountPattern)
+		row := db.QueryRow(context.Background(), rowCountPattern)
 		if err := row.Scan(&beneRowCount); err != nil {
 			logger.Panicln("error getting bene row count")
 			logger.Fatal(err)
@@ -301,14 +292,14 @@ func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger) {
 }
 
 // searches the history table for unique benes to add to the queue
-func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatch, wg *sync.WaitGroup, logger *log.Logger, rowsLeft *uint64, feedLimit uint64, batchDoneChan chan<- bool) {
+func queueWorker(id int, db *pgxpool.Pool, queue *badger.DB, batches <-chan *queueBatch, wg *sync.WaitGroup, logger *log.Logger, rowsLeft *uint64, feedLimit uint64, batchDoneChan chan<- bool) {
 	// poll the channel for batches to process
 	for qry := range batches {
 		// create new instance of qry to ensure it's unique in each goroutine
 		qry := qry
 
 		// execute the batch query
-		rows, err := db.Query(queuePattern, qry.Offset, qry.Limit)
+		rows, err := db.Query(context.Background(), queuePattern, qry.Offset, qry.Limit)
 		if err != nil {
 			logger.Println("error fetching query batch")
 			logger.Fatal(err)
@@ -333,20 +324,14 @@ func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatc
 
 // runs cleanup workers for each bene in the queue
 func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan chan<- bool, dupCounter *uint64) {
-	// postgres - (use reader db settings)
-	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable connect_timeout=5", cfg.RwDbHost, cfg.RwDbPort, cfg.RwDbUser, cfg.RwDbPassword, cfg.DbName)
-	db, err := sql.Open("postgres", psqlInfo)
+	// connect to postgres
+	psqlInfo := fmt.Sprintf("postgres://%s:%s@%s:%d/%s", cfg.RwDbUser, cfg.RwDbPassword, cfg.RwDbHost, cfg.RwDbPort, cfg.DbName)
+	db, err := pgxpool.Connect(context.Background(), psqlInfo)
 	if err != nil {
-		fmt.Println("database connection error")
 		logger.Fatal(err)
 	}
+	db.Config().MaxConns = int32(cfg.NumDupWorkers)
 	defer db.Close()
-
-	// test the connection
-	if err = db.Ping(); err != nil {
-		logger.Fatal(err)
-	}
-	fmt.Printf("connected to %v.\n", cfg.RwDbHost)
 
 	// determine how many dup workers to use
 	var numDupWorkers int
@@ -378,7 +363,8 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan
 	fmt.Println("deleting dups.")
 	err = queue.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
+		opts.PrefetchValues = true
+		opts.PrefetchSize = cfg.DupBuffer
 		it := txn.NewIterator(opts)
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
@@ -413,37 +399,32 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan
 	}
 }
 
-func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.DB, logger *log.Logger, cfg *Config, dupDoneChan chan<- bool, dupCounter *uint64, wg *sync.WaitGroup) {
+func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *pgxpool.Pool, logger *log.Logger, cfg *Config, dupDoneChan chan<- bool, dupCounter *uint64, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for bene := range beneChan {
 		bene := bene
 		beneid := bene.Key()
 
 		// delete the dups
-		result, err := db.Exec(deletePattern, beneid)
+		conn, err := db.Acquire(context.Background())
+		if err != nil {
+			fmt.Println(err)
+		}
+		defer conn.Release()
+		result, err := conn.Exec(context.Background(), deletePattern, beneid)
 		if err != nil {
 			logger.Printf("error deleting dups for %v.. skipping.\n", string(beneid))
+			conn.Release()
 			continue
 		}
-		rowsDeleted, _ := result.RowsAffected()
-
+		rowsDeleted := result.RowsAffected()
+		conn.Release()
 		// mark bene as completed
-		var tryCount int
-	UPDATE:
 		ok, err := badgerWrite(queue, beneid, []byte("1"))
 		if err == nil && ok == true {
 			*dupCounter += uint64(rowsDeleted)
 			// atomic.AddUint64(dupCounter, uint64(rowsDeleted))
 			dupDoneChan <- true
-		} else {
-			// backoff and try again
-			tryCount++
-			if tryCount == 2 {
-				// skip it
-				continue
-			}
-			time.Sleep(time.Duration(rand.Intn(2)) * time.Second)
-			goto UPDATE
 		}
 	}
 }
