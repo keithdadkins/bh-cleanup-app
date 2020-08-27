@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -334,9 +334,10 @@ func queueWorker(id int, db *sql.DB, queue *badger.DB, batches <-chan *queueBatc
 // runs cleanup workers for each bene in the queue
 func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan chan<- bool, dupCounter *uint64) {
 	// postgres - (use reader db settings)
-	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable", cfg.RwDbHost, cfg.RwDbPort, cfg.RwDbUser, cfg.RwDbPassword, cfg.DbName)
+	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable connect_timeout=5", cfg.RwDbHost, cfg.RwDbPort, cfg.RwDbUser, cfg.RwDbPassword, cfg.DbName)
 	db, err := sql.Open("postgres", psqlInfo)
 	if err != nil {
+		fmt.Println("database connection error")
 		logger.Fatal(err)
 	}
 	defer db.Close()
@@ -364,7 +365,7 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan
 	}
 
 	// launch the dup workers
-	fmt.Printf("spawning %v dup workers.\n", numDupWorkers)
+	fmt.Printf("spawning %v dup workers with %v buffers.\n", numDupWorkers, dupBuffer)
 	var beneChan = make(chan *badger.Item, dupBuffer)
 	var wg sync.WaitGroup
 	var i int
@@ -418,34 +419,31 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.D
 		bene := bene
 		beneid := bene.Key()
 
-		// start a db transaction
-		txn, err := db.Begin()
-		if err != nil {
-			fmt.Println("error connecting to db to delete dups")
-			logger.Fatal(err)
-		}
-		defer txn.Rollback()
-
 		// delete the dups
-		result, err := txn.Exec(deletePattern, beneid)
+		result, err := db.Exec(deletePattern, beneid)
 		if err != nil {
-			logger.Println("error deleting dups for ", string(beneid))
-			logger.Fatal(err)
+			logger.Printf("error deleting dups for %v.. skipping.\n", string(beneid))
+			continue
 		}
-		rowsDeleted, err := result.RowsAffected()
-		if err != nil {
-			logger.Fatal(err)
-		}
+		rowsDeleted, _ := result.RowsAffected()
 
-		// mark bene as completed, else rollback txn
+		// mark bene as completed
+		var tryCount int
+	UPDATE:
 		ok, err := badgerWrite(queue, beneid, []byte("1"))
 		if err == nil && ok == true {
-			txn.Commit()
-			atomic.AddUint64(dupCounter, uint64(rowsDeleted))
+			*dupCounter += uint64(rowsDeleted)
+			// atomic.AddUint64(dupCounter, uint64(rowsDeleted))
 			dupDoneChan <- true
 		} else {
-			txn.Rollback()
-			logger.Println("error marking bene as done in badger.", string(beneid))
+			// backoff and try again
+			tryCount++
+			if tryCount == 2 {
+				// skip it
+				continue
+			}
+			time.Sleep(time.Duration(rand.Intn(2)) * time.Second)
+			goto UPDATE
 		}
 	}
 }
