@@ -197,14 +197,7 @@ func badgerCloseHandler(queue *badger.DB, dupCounter *uint64) {
 }
 
 // builds (or continues building) the queue of bene id's
-func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger) {
-	psqlInfo := fmt.Sprintf("postgres://%s:%s@%s:%d/%s", cfg.RwDbUser, cfg.RwDbPassword, cfg.RwDbHost, cfg.RwDbPort, cfg.DbName)
-	db, err := pgxpool.Connect(context.Background(), psqlInfo)
-	if err != nil {
-		logger.Fatal(err)
-	}
-	defer db.Close()
-
+func buildQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Logger) {
 	// get number of benes we are processing
 	var beneRowCount uint64
 	if cfg.BeneTableRows > 0 {
@@ -291,7 +284,7 @@ func buildQueue(queue *badger.DB, cfg *Config, logger *log.Logger) {
 	os.Exit(0)
 }
 
-// searches the history table for unique benes to add to the queue
+// adds benes to the queue
 func queueWorker(id int, db *pgxpool.Pool, queue *badger.DB, batches <-chan *queueBatch, wg *sync.WaitGroup, logger *log.Logger, rowsLeft *uint64, feedLimit uint64, batchDoneChan chan<- bool) {
 	// poll the channel for batches to process
 	for qry := range batches {
@@ -322,17 +315,8 @@ func queueWorker(id int, db *pgxpool.Pool, queue *badger.DB, batches <-chan *que
 	wg.Done()
 }
 
-// runs cleanup workers for each bene in the queue
-func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan chan<- bool, dupCounter *uint64) {
-	// connect to postgres
-	psqlInfo := fmt.Sprintf("postgres://%s:%s@%s:%d/%s", cfg.RwDbUser, cfg.RwDbPassword, cfg.RwDbHost, cfg.RwDbPort, cfg.DbName)
-	db, err := pgxpool.Connect(context.Background(), psqlInfo)
-	if err != nil {
-		logger.Fatal(err)
-	}
-	db.Config().MaxConns = int32(cfg.NumDupWorkers)
-	defer db.Close()
-
+// proccessing the queue for benes to cleanup
+func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan chan<- bool, dupCounter *uint64) {
 	// determine how many dup workers to use
 	var numDupWorkers int
 	if cfg.NumDupWorkers > 0 {
@@ -350,21 +334,20 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan
 	}
 
 	// launch the dup workers
-	fmt.Printf("spawning %v dup workers with %v buffers.\n", numDupWorkers, dupBuffer)
+	fmt.Printf("spawning %v dup workers.\n", numDupWorkers)
 	var beneChan = make(chan *badger.Item, dupBuffer)
 	var wg sync.WaitGroup
-	var i int
-	for i = 0; i < numDupWorkers; i++ {
+	for i := 0; i < numDupWorkers; i++ {
 		wg.Add(1)
 		go dupWorker(i, queue, beneChan, db, logger, cfg, dupDoneChan, dupCounter, &wg)
 	}
 
 	// send unprocessed benes to the workers
 	fmt.Println("deleting dups.")
-	err = queue.View(func(txn *badger.Txn) error {
+	err := queue.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = true
-		opts.PrefetchSize = cfg.DupBuffer
+		opts.PrefetchSize = dupBuffer
 		it := txn.NewIterator(opts)
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
@@ -419,13 +402,13 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *pgxpo
 		}
 		rowsDeleted := result.RowsAffected()
 		conn.Release()
+
 		// mark bene as completed
 		ok, err := badgerWrite(queue, beneid, []byte("1"))
 		if err == nil && ok == true {
 			*dupCounter += uint64(rowsDeleted)
-			// atomic.AddUint64(dupCounter, uint64(rowsDeleted))
-			dupDoneChan <- true
 		}
+		dupDoneChan <- true
 	}
 }
 
@@ -443,6 +426,14 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
+
+	// open postgres
+	psqlInfo := fmt.Sprintf("postgres://%s:%s@%s:%d/%s", cfg.RwDbUser, cfg.RwDbPassword, cfg.RwDbHost, cfg.RwDbPort, cfg.DbName)
+	db, err := pgxpool.Connect(context.Background(), psqlInfo)
+	if err != nil {
+		logger.Fatal(err)
+	}
+	defer db.Close()
 
 	// parse flags
 	buildQueueFlag := flag.Bool("build-queue", false, "build the queue")
@@ -523,7 +514,7 @@ func main() {
 
 	// build the queue
 	if *buildQueueFlag {
-		buildQueue(queue, &cfg, logger)
+		buildQueue(db, queue, &cfg, logger)
 	}
 	qCount, doneCount, err := badgerStatus(queue)
 	if err != nil {
@@ -556,7 +547,7 @@ func main() {
 	// process the queue
 	if *processQueueFlag == true {
 		fmt.Println("processing the queue for duplicates.")
-		processQueue(queue, &cfg, logger, dupDoneChan, &dupCounter)
+		processQueue(db, queue, &cfg, logger, dupDoneChan, &dupCounter)
 	}
 	bar.FinishPrint("complete.")
 }
