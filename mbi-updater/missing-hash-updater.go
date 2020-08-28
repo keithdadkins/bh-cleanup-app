@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -19,8 +19,8 @@ import (
 
 	"github.com/cheggaaa/pb"
 	badger "github.com/dgraph-io/badger/v2"
+	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/kelseyhightower/envconfig"
-	_ "github.com/lib/pq"
 	"golang.org/x/crypto/pbkdf2"
 	"golang.org/x/text/message"
 )
@@ -110,6 +110,39 @@ func badgerCloseHandler(queue *badger.DB) {
 	}()
 }
 
+// returns number of benes in the queue, number of benes completed, and an error (nil if success)
+func badgerStatus(b *badger.DB) (uint64, uint64, error) {
+	// get/display queue status
+	var qCount uint64
+	var doneCount uint64
+	err := b.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			var status string
+			err := item.Value(func(v []byte) error {
+				status = string(v)
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			if status == "2" || status == "3" {
+				doneCount++
+			}
+			qCount++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return qCount, doneCount, err
+}
+
 // hashes mbi using PBKDF2-HMAC-SHA256 and sets *hashedMBI to the result
 func hashMBI(mbi []byte, hashedMBI *string, cfg *Config) error {
 	// decode the pepper from hex
@@ -134,22 +167,7 @@ func testHash(testmbi string, expected string, cfg *Config) bool {
 }
 
 // runs cleanup workers for each bene in the queue
-func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, hashDoneChan chan<- bool) {
-
-	// postgres - (use reader db settings)
-	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable", cfg.RwDbHost, cfg.RwDbPort, cfg.RwDbUser, cfg.RwDbPassword, cfg.DbName)
-	db, err := sql.Open("postgres", psqlInfo)
-	if err != nil {
-		logger.Fatal(err)
-	}
-	defer db.Close()
-
-	// test the connection
-	if err = db.Ping(); err != nil {
-		logger.Fatal(err)
-	}
-	fmt.Printf("connected to %v.\n", cfg.RwDbHost)
-
+func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Logger, hashDoneChan chan<- bool) {
 	// determine how many workers to use
 	var numHashWorkers int
 	if cfg.MbiNumHashWorkers > 0 {
@@ -179,7 +197,7 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, hashDoneCha
 
 	// loop through all the keys and to workers for processing TODO: update
 	fmt.Println("updating missing mbi hashes.")
-	err = queue.View(func(txn *badger.Txn) error {
+	err := queue.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
@@ -205,7 +223,7 @@ func processQueue(queue *badger.DB, cfg *Config, logger *log.Logger, hashDoneCha
 
 }
 
-func hashWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.DB, logger *log.Logger, cfg *Config, hashDoneChan chan<- bool, hashesUpdated *uint64) {
+func hashWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *pgxpool.Pool, logger *log.Logger, cfg *Config, hashDoneChan chan<- bool, hashesUpdated *uint64) {
 	for bene := range beneChan {
 		bene := bene
 		beneid := bene.Key()
@@ -229,8 +247,15 @@ func hashWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.
 		}
 
 		// look for missing mbi's
-		txn, err := db.Begin()
-		rows, err := txn.Query(missingMbiPattern, string(beneid))
+		conn, err := db.Acquire(context.Background())
+		if err != nil {
+			logger.Println(err)
+			conn.Release()
+			continue
+		}
+		defer conn.Release()
+		txn, err := conn.Begin(context.Background())
+		rows, err := txn.Query(context.Background(), missingMbiPattern, string(beneid))
 		if err != nil {
 			logger.Println("error querying missing mbi hashes for ", string(beneid))
 			logger.Fatal(err)
@@ -258,32 +283,40 @@ func hashWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *sql.
 			hashQueue = append(hashQueue, batch)
 			hashCounter++
 		}
-		txn.Commit()
+		txn.Commit(context.Background())
 		rows.Close()
+		conn.Release()
 
+		// update the record
+		conn, err = db.Acquire(context.Background())
+		if err != nil {
+			logger.Println(err)
+			conn.Release()
+			continue
+		}
+		defer conn.Release()
+
+		txn, err = conn.Begin(context.Background())
+		if err != nil {
+			logger.Fatal(err)
+		}
 		for _, hash := range hashQueue {
-			// update the record
-			txn, err := db.Begin()
+			_, err = txn.Exec(context.Background(), updateHashPattern, hash.mbiHash, beneid, hash.beneHistoryID)
 			if err != nil {
-				logger.Fatal(err)
-			}
-			_, err = txn.Exec(updateHashPattern, hash.mbiHash, beneid, hash.beneHistoryID)
-			if err != nil {
-				txn.Rollback()
+				txn.Rollback(context.Background())
+				conn.Release()
 				logger.Printf("error executing query for bene: %v - bh history entry: %v\n", string(beneid), hash.beneHistoryID)
 				logger.Fatal(err)
 			}
-			txn.Commit()
 		}
+		txn.Commit(context.Background())
+		conn.Release()
 
 		// mark bene as done
 		ok, _ := badgerWrite(queue, beneid, []byte("2"))
 		if ok {
 			atomic.AddUint64(hashesUpdated, uint64(hashCounter))
-			txn.Commit()
 			hashDoneChan <- true
-		} else {
-			txn.Rollback()
 		}
 	}
 }
@@ -310,6 +343,14 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+
+	// open postgres
+	psqlInfo := fmt.Sprintf("postgres://%s:%s@%s:%d/%s", cfg.RwDbUser, cfg.RwDbPassword, cfg.RwDbHost, cfg.RwDbPort, cfg.DbName)
+	db, err := pgxpool.Connect(context.Background(), psqlInfo)
+	if err != nil {
+		logger.Fatal(err)
+	}
+	defer db.Close()
 
 	// test hashing function
 	fmt.Println("testing hashing function.")
@@ -360,25 +401,13 @@ func main() {
 	os.Stdout = oldStdout
 	<-stdOutChan //so just ignore
 
-	// get/display queue status TODO: update
-	var qCount uint64
-	var doneCount uint64
-	err = queue.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		it := txn.NewIterator(opts)
-		defer it.Close()
-		for it.Rewind(); it.Valid(); it.Next() {
-			if it.Item().ValueSize() > 0 {
-				doneCount++
-			}
-			qCount++
-		}
-		return nil
-	})
+	// get queue status
+	qCount, doneCount, err := badgerStatus(queue)
 	if err != nil {
+		logger.Println("error getting queue status")
 		logger.Fatal(err)
 	}
+
 	numBenesToProcess := (qCount - doneCount)
 	p := message.NewPrinter(message.MatchLanguage("en")) // used to print numbers with comma's
 	p.Printf("queue stats: %v bene's in queue - %v completed - %v remain.\n", qCount, doneCount, numBenesToProcess)
@@ -405,7 +434,7 @@ func main() {
 
 	// process the queue
 	if *processQueueFlag == true {
-		processQueue(queue, &cfg, logger, hashDoneChan)
+		processQueue(db, queue, &cfg, logger, hashDoneChan)
 	}
 	bar.FinishPrint("complete.")
 

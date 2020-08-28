@@ -175,6 +175,9 @@ func badgerStatus(b *badger.DB) (uint64, uint64, error) {
 		}
 		return nil
 	})
+	if err != nil {
+		return 0, 0, err
+	}
 	return qCount, doneCount, err
 }
 
@@ -356,9 +359,7 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 			if err != nil {
 				logger.Fatal(err)
 			}
-			if string(status) == "1" || string(status) == "3" {
-				continue
-			} else {
+			if string(status) != "1" && string(status) != "3" {
 				beneChan <- it.Item()
 			}
 		}
@@ -391,7 +392,7 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *pgxpo
 		// delete the dups
 		conn, err := db.Acquire(context.Background())
 		if err != nil {
-			fmt.Println(err)
+			logger.Println(err)
 		}
 		defer conn.Release()
 		result, err := conn.Exec(context.Background(), deletePattern, beneid)
@@ -405,10 +406,12 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *pgxpo
 
 		// mark bene as completed
 		ok, err := badgerWrite(queue, beneid, []byte("1"))
-		if err == nil && ok == true {
+		if ok {
 			*dupCounter += uint64(rowsDeleted)
+			dupDoneChan <- true
+		} else {
+			logger.Printf("error marking %v done", string(beneid))
 		}
-		dupDoneChan <- true
 	}
 }
 
