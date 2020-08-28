@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -56,6 +57,11 @@ type Config struct {
 type queueBatch struct {
 	Offset uint64 `json:"offset"`
 	Limit  uint64 `json:"limit"`
+}
+
+type beneEntry struct {
+	key   []byte
+	value []byte
 }
 
 // default number of workers adding benes to the queue. (keep this small to reduce lock contention in badger)
@@ -320,7 +326,7 @@ func queueWorker(id int, db *pgxpool.Pool, queue *badger.DB, batches <-chan *que
 
 // proccessing the queue for benes to cleanup
 func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Logger, dupDoneChan chan<- bool, dupCounter *uint64) {
-	// determine how many dup workers to use
+	// determine how many workers to use
 	var numDupWorkers int
 	if cfg.NumDupWorkers > 0 {
 		numDupWorkers = cfg.NumDupWorkers
@@ -338,7 +344,7 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 
 	// launch the dup workers
 	fmt.Printf("spawning %v dup workers.\n", numDupWorkers)
-	var beneChan = make(chan *badger.Item, dupBuffer)
+	var beneChan = make(chan *beneEntry, dupBuffer)
 	var wg sync.WaitGroup
 	for i := 0; i < numDupWorkers; i++ {
 		wg.Add(1)
@@ -354,17 +360,31 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 		it := txn.NewIterator(opts)
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
-			var status []byte
-			err := badgerRead(queue, it.Item().KeyCopy(nil), status)
-			if err != nil {
-				logger.Fatal(err)
-			}
-			if string(status) != "1" && string(status) != "3" {
-				beneChan <- it.Item()
+			item := it.Item()
+			if item.ValueSize() > 0 {
+				// parse status
+				var s []byte
+				_ = badgerRead(queue, item.Key(), s)
+				status := string(s)
+				fmt.Printf(status)
+			} else {
+				bene := beneEntry{key: item.Key(), value: nil}
+				beneChan <- &bene
 			}
 		}
 		return nil
 	})
+	// err := item.Value(func(v []byte) error {
+	// 	var s []byte
+	// 	_ = badgerRead(queue, item.Key(), s)
+	// 	status := string(s)
+	// 	fmt.Printf(status)
+	// 	if status == "" || status == "2" {
+	// 		bene := beneEntry{key: item.Key(), value: v}
+	// 		fmt.Println(bene.key)
+	// 		beneChan <- &bene
+	// 	}
+	// return nil
 	if err != nil {
 		logger.Println("error processing dups")
 		logger.Fatal(err)
@@ -383,11 +403,10 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 	}
 }
 
-func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *pgxpool.Pool, logger *log.Logger, cfg *Config, dupDoneChan chan<- bool, dupCounter *uint64, wg *sync.WaitGroup) {
+func dupWorker(id int, queue *badger.DB, beneChan <-chan *beneEntry, db *pgxpool.Pool, logger *log.Logger, cfg *Config, dupDoneChan chan<- bool, dupCounter *uint64, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for bene := range beneChan {
-		bene := bene
-		beneid := bene.Key()
+		beneid := bene.key
 
 		// delete the dups
 		conn, err := db.Acquire(context.Background())
@@ -395,6 +414,7 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *pgxpo
 			logger.Println(err)
 		}
 		defer conn.Release()
+
 		result, err := conn.Exec(context.Background(), deletePattern, beneid)
 		if err != nil {
 			logger.Printf("error deleting dups for %v.. skipping.\n", string(beneid))
@@ -402,16 +422,30 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *badger.Item, db *pgxpo
 			continue
 		}
 		rowsDeleted := result.RowsAffected()
-		conn.Release()
 
 		// mark bene as completed
-		ok, err := badgerWrite(queue, beneid, []byte("1"))
-		if ok {
-			*dupCounter += uint64(rowsDeleted)
-			dupDoneChan <- true
-		} else {
-			logger.Printf("error marking %v done", string(beneid))
-		}
+		go func() {
+			status := ""
+			switch string(bene.value) {
+			case "":
+				status = "1"
+			case "2":
+				status = "3"
+			}
+
+			txn := queue.NewTransaction(true)
+			err := txn.Set(beneid, []byte(status))
+			if err != nil {
+				txn.Discard()
+				badgerWrite(queue, bene.key, []byte(status))
+			}
+			txn.Commit()
+		}()
+
+		// update progress
+		atomic.AddUint64(dupCounter, uint64(rowsDeleted))
+		dupDoneChan <- true
+		conn.Release()
 	}
 }
 
@@ -431,8 +465,12 @@ func main() {
 	}
 
 	// open postgres
+	fmt.Println("Connecting to postgres max conns: ", cfg.NumDupWorkers)
 	psqlInfo := fmt.Sprintf("postgres://%s:%s@%s:%d/%s", cfg.RwDbUser, cfg.RwDbPassword, cfg.RwDbHost, cfg.RwDbPort, cfg.DbName)
-	db, err := pgxpool.Connect(context.Background(), psqlInfo)
+	config, err := pgxpool.ParseConfig(psqlInfo)
+	config.MaxConns = int32(cfg.NumDupWorkers)
+	config.MaxConnIdleTime = time.Duration(5) * time.Second
+	db, err := pgxpool.ConnectConfig(context.Background(), config)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -519,6 +557,8 @@ func main() {
 	if *buildQueueFlag {
 		buildQueue(db, queue, &cfg, logger)
 	}
+
+	// get total and done count
 	qCount, doneCount, err := badgerStatus(queue)
 	if err != nil {
 		logger.Println("error getting queue status")
@@ -528,7 +568,7 @@ func main() {
 	p := message.NewPrinter(message.MatchLanguage("en")) // used to print numbers with comma's
 	p.Printf("queue stats: %v bene's in queue - %v completed - %v remain.\n", qCount, doneCount, numBenesToProcess)
 
-	// progress bar
+	// setup the progress bar
 	count := int64(numBenesToProcess)
 	bar := pb.New64(count)
 	dupDoneChan := make(chan bool)
@@ -539,11 +579,12 @@ func main() {
 	bar.ShowTimeLeft = true
 	go func() {
 		for <-dupDoneChan {
-			if barStart == false {
+			if barStart == true {
+				bar.Increment()
+			} else {
 				bar.Start()
 				barStart = true
 			}
-			bar.Increment()
 		}
 	}()
 
