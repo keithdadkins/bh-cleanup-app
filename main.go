@@ -139,21 +139,6 @@ func badgerWrite(b *badger.DB, k []byte, v []byte) (bool, error) {
 	return true, err
 }
 
-// return true if key exists
-func badgerCheck(b *badger.DB, k []byte) (bool, error) {
-	err := b.View(func(txn *badger.Txn) error {
-		_, err := txn.Get(k)
-		return err
-	})
-	switch {
-	case err == badger.ErrKeyNotFound:
-		return false, nil
-	case err != nil:
-		return false, err
-	}
-	return true, nil
-}
-
 // returns number of benes in the queue, number of benes completed, and an error (nil if success)
 func badgerStatus(b *badger.DB) (uint64, uint64, error) {
 	// get/display queue status
@@ -374,17 +359,6 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 		}
 		return nil
 	})
-	// err := item.Value(func(v []byte) error {
-	// 	var s []byte
-	// 	_ = badgerRead(queue, item.Key(), s)
-	// 	status := string(s)
-	// 	fmt.Printf(status)
-	// 	if status == "" || status == "2" {
-	// 		bene := beneEntry{key: item.Key(), value: v}
-	// 		fmt.Println(bene.key)
-	// 		beneChan <- &bene
-	// 	}
-	// return nil
 	if err != nil {
 		logger.Println("error processing dups")
 		logger.Fatal(err)
@@ -395,7 +369,7 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 
 	// make sure everyone was processed
 	qCount, doneCount, err := badgerStatus(queue)
-	numLeft := doneCount - qCount
+	numLeft := qCount - doneCount
 	if numLeft > 0 {
 		logger.Println("***** not all benes were processed - please run again ******")
 		logger.Printf("%v remain.\n", numLeft)
@@ -564,7 +538,7 @@ func main() {
 		logger.Println("error getting queue status")
 		logger.Fatal(err)
 	}
-	numBenesToProcess := (qCount - doneCount)
+	numBenesToProcess := qCount - doneCount
 	p := message.NewPrinter(message.MatchLanguage("en")) // used to print numbers with comma's
 	p.Printf("queue stats: %v bene's in queue - %v completed - %v remain.\n", qCount, doneCount, numBenesToProcess)
 
@@ -593,5 +567,6 @@ func main() {
 		fmt.Println("processing the queue for duplicates.")
 		processQueue(db, queue, &cfg, logger, dupDoneChan, &dupCounter)
 	}
-	bar.FinishPrint("complete.")
+	finMsg := fmt.Sprintf("completed. %v duplicates were deleted.", dupCounter)
+	bar.FinishPrint(finMsg)
 }
