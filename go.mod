@@ -8,5 +8,6 @@ require (
 	github.com/elastic/gosigar v0.11.0
 	github.com/jackc/pgx/v4 v4.8.1
 	github.com/kelseyhightower/envconfig v1.4.0
+	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
 	golang.org/x/text v0.3.3
 )
