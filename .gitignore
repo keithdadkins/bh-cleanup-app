@@ -2,3 +2,4 @@ bh-cleanup-app
 **log
 cleanup.queue*
 *.env
+.vscode
