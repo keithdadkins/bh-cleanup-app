@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +25,7 @@ import (
 	"github.com/elastic/gosigar"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/kelseyhightower/envconfig"
+	"golang.org/x/crypto/pbkdf2"
 	"golang.org/x/text/message"
 )
 
@@ -75,11 +80,24 @@ func (b beneEntry) Value() string {
 	return string(b.value)
 }
 
+// used by missing mbi hash workers
+type hashBatch struct {
+	beneHistoryID string
+	mbiHash       string
+}
+
+// missing mbi hash patterns
+const (
+	missingMbiPattern      = `SELECT "beneficiaryHistoryId", "medicareBeneficiaryId" FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL AND "medicareBeneficiaryId" IS NOT NULL ORDER BY "beneficiaryHistoryId";`
+	missingMbiCountPattern = `SELECT count(*) FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL AND "medicareBeneficiaryId" IS NOT NULL;`
+	updateHashPattern      = `UPDATE "BeneficiariesHistory" SET "mbiHash" = $1 WHERE "beneficiaryId" = $2 AND "beneficiaryHistoryId" = $3;`
+)
+
 // default number of workers adding benes to the queue. (keep this small to reduce lock contention in badger)
 const numQueueWorkersDefault = 3
 
 // queue query pattern (gets the bene id's into a local queue for later processing)
-const queuePattern = `SELECT "beneficiaryId" FROM "Beneficiaries" "beneficiaryId" ORDER BY "beneficiaryId" OFFSET $1 LIMIT $2 ;`
+const queuePattern = `SELECT "beneficiaryId" FROM "Beneficiaries" "beneficiaryId" ORDER BY "beneficiaryId" OFFSET $1 LIMIT $2;`
 
 // row count pattern. assumption here is that there is a one->many relation between bene and bene history table
 // if there are benes in the history table that are not in the bene table, change 'FROM "Beneficiaries"' to
@@ -105,7 +123,7 @@ WHERE
  t1."beneficiaryId" = $1
 ) dups 
 WHERE dups.row > 1)
-DELETE FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "beneficiaryHistoryId" IN (SELECT "beneficiaryHistoryId" FROM x)`
+DELETE FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "beneficiaryHistoryId" IN (SELECT "beneficiaryHistoryId" FROM x);`
 
 // gets the current amount of "actual" free memory.
 func freeMem() gosigar.Mem {
@@ -452,6 +470,8 @@ func processDups(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Lo
 	// run garbage collections and flush the queue to disk before we hammer it
 	runtime.GC()
 	queue.RunValueLogGC(0.5)
+
+	// send unduped benes to workers
 	fmt.Println("deduping.")
 	err = queue.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -482,7 +502,6 @@ func processDups(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Lo
 	}
 	close(beneChan)
 	wg.Wait()
-	bar.Increment()
 	finMsg := fmt.Sprintf("%v duplicates were deleted.", *dupCounter)
 	bar.FinishPrint(finMsg)
 
@@ -495,6 +514,7 @@ func processDups(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Lo
 		fmt.Printf("replaying missed benes.\n")
 		processDups(db, queue, cfg, logger, dupCounter)
 	}
+	fmt.Printf("done.\n\n")
 	return nil
 }
 
@@ -584,12 +604,227 @@ func displayQueueStats(queue *badger.DB) error {
 	return nil
 }
 
+// hashes mbi using PBKDF2-HMAC-SHA256 and sets *hashedMBI to the result
+func hashMBI(mbi []byte, hashedMBI *string, cfg *Config) error {
+	// decode the pepper from hex
+	pepper, err := hex.DecodeString(cfg.MbiHashPepper)
+	if err != nil {
+		return err
+	}
+
+	// hash the mbi and set *hashedMbi to the result
+	tmp := pbkdf2.Key(mbi, pepper, cfg.MbiHashIterations, cfg.MbiHashLength, sha256.New)
+	*hashedMBI = fmt.Sprintf("%x", string(tmp))
+	return nil
+}
+
+// test hashing function
+func testHash(testmbi string, expected string, cfg *Config) bool {
+	beneMbi := []byte(testmbi)
+	var mbiHash string
+	hashMBI(beneMbi, &mbiHash, cfg)
+	result := mbiHash == expected
+	return result
+}
+
+// runs cleanup workers for each bene in the queue
+func processHashes(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Logger, hashCounter *uint64) error {
+
+	// test hashing function
+	fmt.Println("testing hashing function.")
+	var testCfg Config
+	testCfg.MbiHashIterations = 1000
+	testCfg.MbiHashLength = 32
+	testCfg.MbiHashPepper = hex.EncodeToString([]byte("nottherealpepper"))
+	t1Start := time.Now()
+	t1 := testHash("123456789A", "d95a418b0942c7910fb1d0e84f900fe12e5a7fd74f312fa10730cc0fda230e9a", &testCfg)
+	t1Duration := time.Since(t1Start)
+	t2Start := time.Now()
+	t2 := testHash("987654321E", "6357f16ebd305103cf9f2864c56435ad0de5e50f73631159772f4a4fcdfe39a5", &testCfg)
+	t2Duration := time.Since(t2Start)
+	if !t1 || !t2 {
+		err := errors.New("error testing hashing function")
+		return err
+	}
+	var hashCost time.Duration
+	hashCost = ((t1Duration + t2Duration) / 2)
+	hashPerMil := hashCost * 1000000
+	fmt.Printf("mbi hashing will take around %v seconds per bene to process (around %v seconds per million)\n", hashCost.Seconds(), fmt.Sprintf("%s", hashPerMil))
+
+	// determine how many workers to use
+	var numHashWorkers int
+	if cfg.NumMbiHashWorkers > 0 {
+		numHashWorkers = cfg.NumMbiHashWorkers
+	} else {
+		numHashWorkers = runtime.NumCPU()
+	}
+
+	// set hash buffer value
+	var hashBuffer int
+	if cfg.MbiHashBuffer > 1 {
+		hashBuffer = cfg.MbiHashBuffer
+	} else {
+		hashBuffer = 1
+	}
+
+	// progress bar
+	qCount, _, mbiCount, err := badgerStatus(queue)
+	numLeft := qCount - mbiCount
+	count := int64(numLeft)
+	bar := pb.New64(count)
+	hashDoneChan := make(chan bool, 1)
+	barStart := false
+	bar.ShowPercent = true
+	bar.ShowBar = true
+	bar.ShowCounters = true
+	bar.ShowTimeLeft = true
+	go func() {
+		for <-hashDoneChan {
+			if barStart == false {
+				bar.Start()
+				barStart = true
+			}
+			bar.Increment()
+		}
+	}()
+
+	// launch the Hash workers
+	fmt.Printf("spawning %v workers.\n", numHashWorkers)
+	var beneChan = make(chan *beneEntry, hashBuffer)
+	var wg sync.WaitGroup
+	var i int
+	for i = 0; i < numHashWorkers; i++ {
+		wg.Add(1)
+		go hashWorker(i, queue, beneChan, db, logger, cfg, &wg, hashDoneChan, hashCounter)
+	}
+
+	// process benes
+	fmt.Println("finding/updating missing mbi hashes.")
+	err = queue.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			err := it.Item().Value(func(v []byte) error {
+				status := string(v)
+				if status == "" || status == "1" {
+					var bene beneEntry
+					bene.key = it.Item().KeyCopy(nil)
+					bene.value = []byte(status)
+					beneChan <- &bene
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		it.Close()
+		return nil
+	})
+	if err != nil {
+		logger.Println("error processing dups")
+		return err
+	}
+	close(beneChan)
+	wg.Wait()
+	bar.Increment()
+	finMsg := fmt.Sprintf("%v MBI hashes were updated.", *hashCounter)
+	bar.FinishPrint(finMsg)
+	fmt.Printf("done.\n\n")
+	return nil
+}
+
+func hashWorker(id int, queue *badger.DB, beneChan <-chan *beneEntry, db *pgxpool.Pool, logger *log.Logger, cfg *Config, wg *sync.WaitGroup, hashDoneChan chan<- bool, hashCounter *uint64) {
+	defer wg.Done()
+	for bene := range beneChan {
+		bene := bene
+
+		// get a connection from the pool
+		conn, err := db.Acquire(context.Background())
+		if err != nil {
+			logger.Println(err)
+			conn.Release()
+			continue
+		}
+		defer conn.Release()
+
+		// look for missing mbi's (wrap in transaction)
+		txn, err := conn.Begin(context.Background())
+		rows, err := txn.Query(context.Background(), missingMbiPattern, bene.Key())
+		if err != nil {
+			txn.Rollback(context.Background())
+			logger.Println(err)
+		}
+		defer rows.Close()
+
+		// parse results into a slice of hash batches
+		var hashQueue []hashBatch
+		var numHashes int
+		for rows.Next() {
+			// hash the mbi
+			var beneHistoryID string
+			var mbi string
+			var mbiHash string
+			rows.Scan(&beneHistoryID, &mbi)
+			if err := hashMBI([]byte(mbi), &mbiHash, cfg); err != nil {
+				logger.Printf("error hashing mbi for %v bh id %v\n", bene.Key(), beneHistoryID)
+				txn.Rollback(context.Background())
+				continue
+			}
+
+			// add to the batch
+			batch := hashBatch{beneHistoryID: beneHistoryID, mbiHash: mbiHash}
+			hashQueue = append(hashQueue, batch)
+			numHashes++
+		}
+		txn.Commit(context.Background())
+		rows.Close()
+		conn.Release()
+
+		// update the record (had troubles executing more than one op in a txn)
+		conn, err = db.Acquire(context.Background())
+		if err != nil {
+			logger.Println(err)
+			conn.Release()
+			continue
+		}
+		defer conn.Release()
+
+		txn, err = conn.Begin(context.Background())
+		if err != nil {
+			logger.Fatal(err)
+		}
+		for _, hash := range hashQueue {
+			beneid, _ := strconv.Atoi(hash.beneHistoryID) // undocumented, but it appears Atoi can handle int64 as well
+			result, err := txn.Exec(context.Background(), updateHashPattern, hash.mbiHash, bene.Key(), int64(beneid))
+			if err != nil {
+				txn.Rollback(context.Background())
+				conn.Release()
+				logger.Println("error updating bene record after hashing.")
+				logger.Fatal(err)
+			}
+			if result.RowsAffected() > 0 {
+				atomic.AddUint64(hashCounter, uint64(numHashes))
+			}
+		}
+		txn.Commit(context.Background())
+		conn.Release()
+
+		// mark bene as done
+		ok, err := badgerWrite(queue, bene.key, []byte("2"))
+		if !ok {
+			logger.Println("error marking (mbi) bene complete. ignoring.")
+			logger.Println(err)
+		}
+		hashDoneChan <- true
+	}
+}
+
 func main() {
 	// custom error logger with date and time
 	logger := log.New(os.Stderr, "", log.Ldate|log.Ltime)
-
-	// global counter for tracking number of duplicates deleted
-	var dupCounter uint64
 
 	// load app settings from environment
 	var cfg Config
@@ -643,19 +878,15 @@ func main() {
 	flag.CommandLine.SetOutput(os.Stdout)
 	buildQueueFlag := flag.Bool("build-queue", false, "build the queue")
 	processDupsFlag := flag.Bool("process-dups", false, "run dedup process")
+	processHashesFlag := flag.Bool("process-hashes", false, "update missing mbi hashes.")
 	resetQueueFlag := flag.Bool("reset-queue", false, "resets all benes to an unprocessed state")
 	statsFlag := flag.Bool("stats", false, "display queue stats")
+	flagged := false
 	flag.Parse()
-
-	// if no flags, show stats and exit
-	if *buildQueueFlag != true && *processDupsFlag != true && *resetQueueFlag != true && *statsFlag != true {
-		fmt.Println("nothing to do.")
-		flag.Usage()
-		os.Exit(1)
-	}
 
 	// rebuild/reset the queue
 	if *resetQueueFlag {
+		flagged = true
 		err := resetQueue(db, logger, queue, &cfg)
 		if err != nil {
 			logger.Fatal(err)
@@ -664,6 +895,7 @@ func main() {
 
 	// build the queue
 	if *buildQueueFlag {
+		flagged = true
 		err := buildQueue(db, queue, &cfg, logger)
 		if err != nil {
 			logger.Fatal(err)
@@ -672,19 +904,46 @@ func main() {
 
 	// process the queue for dups
 	if *processDupsFlag == true {
+		flagged = true
 		// used to track progress on replays
+		var dupCounter uint64
 		err := processDups(db, queue, &cfg, logger, &dupCounter)
 		if err != nil {
 			logger.Fatal(err)
 		}
 	}
 
+	// process the queue for missing hashes
+	if *processHashesFlag == true {
+		flagged = true
+		var hashCounter uint64
+		err := processHashes(db, queue, &cfg, logger, &hashCounter)
+		if err != nil {
+			logger.Fatal(err)
+		}
+		if *processDupsFlag {
+			// run the dedup process again after hashing
+			var dupCounter uint64
+			err := processDups(db, queue, &cfg, logger, &dupCounter)
+			if err != nil {
+				logger.Fatal(err)
+			}
+		}
+	}
+
 	// display queue stats
 	if *statsFlag == true {
+		flagged = true
 		fmt.Println("gathering stats.")
 		if err := displayQueueStats(queue); err != nil {
 			logger.Fatal(err)
 		}
 		os.Exit(0)
+	}
+
+	if !flagged {
+		fmt.Println("nothing to do.")
+		flag.Usage()
+		os.Exit(1)
 	}
 }
