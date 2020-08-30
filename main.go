@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
@@ -36,6 +35,7 @@ type Config struct {
 	RwDbUser          string `envconfig:"BH_RW_DB_USER"`
 	RwDbPassword      string `envconfig:"BH_RW_DB_PASSWORD"`
 	DbName            string `envconfig:"BH_DB_NAME"`
+	DbMaxConns        int    `envconfig:"BH_DB_MAX_CONNS"`
 	HistoryTableName  string `envconfig:"BH_DB_HISTORY_TABLE_NAME"`
 	HistoryTableRows  uint64 `envconfig:"BH_DB_HISTORY_TABLE_ROWS"`
 	BeneTableRows     uint64 `envconfig:"BH_DB_BENE_TABLE_ROWS"`
@@ -78,13 +78,16 @@ func (b beneEntry) Value() string {
 // default number of workers adding benes to the queue. (keep this small to reduce lock contention in badger)
 const numQueueWorkersDefault = 3
 
-// row count pattern
+// queue query pattern (gets the bene id's into a local queue for later processing)
+const queuePattern = `SELECT "beneficiaryId" FROM "Beneficiaries" "beneficiaryId" ORDER BY "beneficiaryId" OFFSET $1 LIMIT $2 ;`
+
+// row count pattern. assumption here is that there is a one->many relation between bene and bene history table
+// if there are benes in the history table that are not in the bene table, change 'FROM "Beneficiaries"' to
+// 'FROM "BeneficiariesHistory"'. This will *GREATLY* increase the time to build the queue however.
 const rowCountPattern = `SELECT count(*) FROM "Beneficiaries";`
 
-// queue query pattern
-const queuePattern = `SELECT "beneficiaryId" FROM "Beneficiaries" "beneficiaryId" OFFSET $1 LIMIT $2 ;`
-
-// delete query pattern
+// delete query pattern - this takes advantage of indexes and 'ROW_NUMBER OVER PARTITION' pattern to make this query
+// very fast.
 const deletePattern = `WITH x AS (SELECT "beneficiaryHistoryId" FROM (SELECT
 	"beneficiaryHistoryId",
  	ROW_NUMBER() OVER(PARTITION BY 
@@ -133,30 +136,22 @@ func badgerRead(b *badger.DB, k []byte, v []byte) error {
 	return err
 }
 
-// badger write k with v
+// badger write k with v.
 func badgerWrite(b *badger.DB, k []byte, v []byte) (bool, error) {
 	txn := b.NewTransaction(true)
-	err := txn.Set(k, v)
-	if err != nil {
-		err = txn.Commit()
-		if err != nil {
-			// try again
-			txn.Discard()
-			txn = b.NewTransaction(true)
-			if err = txn.Set([]byte(k), []byte(v)); err != nil {
-				return false, err
-			}
-			return true, nil
+	if err := txn.Set(k, v); err == badger.ErrTxnTooBig {
+		if err := txn.Commit(); err != nil {
+			return false, err
+		}
+		txn = b.NewTransaction(true)
+		if err := txn.Commit(); err != nil {
+			return false, err
 		}
 	}
-	err = txn.Commit()
-	if err != nil {
-		return false, err
-	}
-	return true, err
+	return true, nil
 }
 
-// returns number of benes in the queue, number of benes completed, and an error (nil if success)
+// returns number of benes in the queue, number of benes dedups completed, and an error (nil if success)
 func badgerStatus(b *badger.DB) (uint64, uint64, error) {
 	// get/display queue status
 	var qCount uint64
@@ -190,39 +185,55 @@ func badgerStatus(b *badger.DB) (uint64, uint64, error) {
 }
 
 // trap ctl-c, kill, etc and try to gracefully close badger (50/50 chance this will work, so try to let jobs finish and do not count on this.)
-func badgerCloseHandler(queue *badger.DB, dupCounter *uint64) {
+// TODO: could use context package to gracefully handle it
+func badgerCloseHandler(queue *badger.DB) {
 	c := make(chan os.Signal)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		fmt.Printf("closing badger. %v dups deleted.\n", *dupCounter)
+		fmt.Printf("closing badger.\n")
 		if err := queue.Close(); err != nil {
+			// backoff and try again
 			time.Sleep(time.Second * 5)
 			if err = queue.Close(); err != nil {
 				os.Exit(1)
 			}
-			os.Exit(0)
 		}
 		os.Exit(0)
 	}()
 }
 
-// builds (or continues building) the queue of bene id's
-func buildQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Logger, rowsLeft *uint64) error {
-	// get number of benes we are processing
-	if *rowsLeft < 1 {
-		if cfg.BeneTableRows > 0 {
-			// row count was manually set via env vars, use it
-			*rowsLeft = cfg.BeneTableRows
-		} else {
-			fmt.Println("getting row count from server.. this could take some time.")
-			row := db.QueryRow(context.Background(), rowCountPattern)
-			if err := row.Scan(rowsLeft); err != nil {
-				logger.Println("error getting bene row count")
-				return err
-			}
+// returns the total number of benes that should be in the queue
+func getTotalBenes(db *pgxpool.Pool, logger *log.Logger, cfg *Config) (uint64, error) {
+	var totalBenes uint64
+	if cfg.BeneTableRows > 0 {
+		// row count was manually set via env vars, use it
+		totalBenes = uint64(cfg.BeneTableRows)
+	} else {
+		row := db.QueryRow(context.Background(), rowCountPattern)
+		if err := row.Scan(&totalBenes); err != nil {
+			logger.Println("error getting bene row count")
+			return 0, err
 		}
 	}
+	return totalBenes, nil
+}
+
+// builds (or continues building) the queue of bene id's
+func buildQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Logger) error {
+
+	var totalBenes uint64
+	// var numLeft uint64
+	totalBenes, err := getTotalBenes(db, logger, cfg)
+	if err != nil {
+		return err
+	}
+	entryCount, _, err := badgerStatus(queue)
+	if err != nil {
+		fmt.Println("error getting queue stats")
+		return err
+	}
+	numLeft := totalBenes - entryCount
 
 	// determine how many workers to use
 	var numQueueWorkers int
@@ -247,32 +258,34 @@ func buildQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Log
 	}
 
 	// fixup if limit is > num rows
-	if feedLimit > *rowsLeft {
-		feedLimit = *rowsLeft
+	if feedLimit > totalBenes {
+		feedLimit = totalBenes
 	}
 
 	// we do not need more workers than batches
-	numBatches := *rowsLeft / feedLimit
-	if numQueueWorkers > int(numBatches) {
+	numBatches := totalBenes / feedLimit
+	if uint64(numQueueWorkers) > numBatches {
 		numQueueWorkers = int(numBatches)
 	}
 
 	// progress bar
-	count := int64(*rowsLeft)
+	count := int64(numLeft)
 	bar := pb.New64(count)
-	batchDoneChan := make(chan bool)
+	batchDoneChan := make(chan int64)
 	barStart := false
 	bar.ShowPercent = true
 	bar.ShowBar = true
 	bar.ShowCounters = false
-	bar.ShowTimeLeft = true
+	bar.ShowTimeLeft = false
+	bar.ShowElapsedTime = true
 	go func() {
-		for <-batchDoneChan {
+		for num := range batchDoneChan {
 			if barStart == false {
 				bar.Start()
 				barStart = true
 			}
-			bar.Increment()
+			bar.Add64(num)
+			numLeft -= uint64(num)
 		}
 	}()
 
@@ -282,13 +295,13 @@ func buildQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Log
 	var wg sync.WaitGroup
 	for i := 0; i < numQueueWorkers; i++ {
 		wg.Add(1)
-		go queueWorker(i, db, queue, queueChan, &wg, logger, rowsLeft, feedLimit, batchDoneChan)
+		go queueWorker(i, db, queue, queueChan, &wg, logger, &totalBenes, batchDoneChan)
 	}
 
 	// send workers batches to process
-	fmt.Println("adding benes to the queue.")
+	fmt.Printf("adding benes to the queue.\n")
 	var offset uint64
-	for counter := uint64(0); counter < *rowsLeft; counter += feedLimit {
+	for counter := uint64(0); counter < totalBenes; counter += feedLimit {
 		qb := queueBatch{offset, feedLimit}
 		queueChan <- &qb
 		offset += feedLimit
@@ -300,25 +313,27 @@ func buildQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Log
 	bar.Set64(count)
 	bar.Finish()
 
-	// make sure all benes have valid badger entries.. replay until they do.
-	entryCount, _, err := badgerStatus(queue)
+	// verify
+	queue.RunValueLogGC(0.5)
+	entryCount, _, err = badgerStatus(queue)
 	if err != nil {
 		fmt.Println("error getting queue stats")
 		return err
 	}
-	p := message.NewPrinter(message.MatchLanguage("en")) // used to print numbers with comma's
-	p.Printf("queue stats: number of benes in queue %v - number remaining %v.\n", entryCount, *rowsLeft)
-
-	if *rowsLeft > 0 {
-		fmt.Printf("replaying missed benes.\n---\n")
-		buildQueue(db, queue, cfg, logger, rowsLeft)
+	p := message.NewPrinter(message.MatchLanguage("en")) // used to pretty print numbers
+	p.Printf("queue stats: %v benes of %v in the queue.\n", entryCount, totalBenes)
+	fmt.Printf("%v benes were missed\n", numLeft)
+	numLeft = totalBenes - entryCount
+	if numLeft > 0 {
+		fmt.Printf("missing benes.. replaying.\n---\n")
+		buildQueue(db, queue, cfg, logger)
 	}
-
 	return nil
 }
 
 // adds benes to the queue
-func queueWorker(id int, db *pgxpool.Pool, queue *badger.DB, batches <-chan *queueBatch, wg *sync.WaitGroup, logger *log.Logger, rowsLeft *uint64, feedLimit uint64, batchDoneChan chan<- bool) {
+func queueWorker(id int, db *pgxpool.Pool, queue *badger.DB, batches <-chan *queueBatch, wg *sync.WaitGroup, logger *log.Logger, numLeft *uint64, batchDoneChan chan<- int64) {
+	defer wg.Done()
 	// poll the channel for batches to process
 	for qry := range batches {
 		// create a shadow instance of qry to ensure it's unique in each goroutine
@@ -333,30 +348,38 @@ func queueWorker(id int, db *pgxpool.Pool, queue *badger.DB, batches <-chan *que
 		defer rows.Close()
 
 		// parse the results
+		var benesToProcess []beneEntry
+		var rowsDone int64
 		for rows.Next() {
-			var beneid string
-			err = rows.Scan(&beneid)
+			var bene beneEntry
+			err = rows.Scan(&bene.key)
 			if err != nil {
 				logger.Fatal(err)
 			}
-			ok, err := badgerWrite(queue, []byte(beneid), nil)
-			if !ok {
-				logger.Println(err)
+			err = badgerRead(queue, bene.key, bene.value)
+			if err != nil {
+				benesToProcess = append(benesToProcess, bene)
 			}
 		}
 		rows.Close()
-		result := rows.CommandTag()
-		*rowsLeft -= uint64(result.RowsAffected())
-		batchDoneChan <- true
 
-		// periodically run a garbage collection on the queue. this helps speed up badger and helps keep
-		// the size down
-		if rand.Intn(5) == 1 {
-			queue.RunValueLogGC(0.5)
+		// process the results
+		txn := queue.NewTransaction(true)
+		for _, bene := range benesToProcess {
+			key := bene.key
+			if err := txn.Set(key, nil); err == badger.ErrTxnTooBig {
+				_ = txn.Commit()
+				txn = queue.NewTransaction(true)
+				_ = txn.Set(key, nil)
+			}
+			rowsDone++
 		}
-
+		if err := txn.Commit(); err != nil {
+			logger.Println("error processing batch")
+			logger.Fatal(err)
+		}
+		batchDoneChan <- rowsDone
 	}
-	wg.Done()
 }
 
 // proccessing the queue for benes to cleanup
@@ -490,7 +513,7 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *beneEntry, db *pgxpool
 		}
 		defer conn.Release()
 
-		// delete teh dups
+		// delete the dups
 		result, err := conn.Exec(context.Background(), deletePattern, bene.Key())
 		if err != nil {
 			logger.Printf("%v", err)
@@ -580,7 +603,7 @@ func main() {
 	// open postgres
 	psqlInfo := fmt.Sprintf("postgres://%s:%s@%s:%d/%s", cfg.RwDbUser, cfg.RwDbPassword, cfg.RwDbHost, cfg.RwDbPort, cfg.DbName)
 	config, err := pgxpool.ParseConfig(psqlInfo)
-	config.MaxConns = int32(cfg.NumDupWorkers)
+	config.MaxConns = int32(cfg.DbMaxConns)
 	config.MaxConnIdleTime = time.Duration(5) * time.Second
 	db, err := pgxpool.ConnectConfig(context.Background(), config)
 	if err != nil {
@@ -624,7 +647,7 @@ func main() {
 		logger.Fatal(err)
 	}
 	defer queue.Close()
-	badgerCloseHandler(queue, &dupCounter)
+	badgerCloseHandler(queue)
 
 	// close the pipe and go back to normal stdout. badger really only writes to stderr anyway.
 	w.Close()
@@ -638,9 +661,7 @@ func main() {
 
 	// build the queue
 	if *buildQueueFlag {
-		// used to track progress on replays
-		var rowsLeft uint64
-		err := buildQueue(db, queue, &cfg, logger, &rowsLeft)
+		err := buildQueue(db, queue, &cfg, logger)
 		if err != nil {
 			logger.Fatal(err)
 		}
