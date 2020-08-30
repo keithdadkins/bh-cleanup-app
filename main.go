@@ -139,7 +139,9 @@ func badgerRead(b *badger.DB, k []byte, v []byte) error {
 // badger write k with v.
 func badgerWrite(b *badger.DB, k []byte, v []byte) (bool, error) {
 	txn := b.NewTransaction(true)
+	defer txn.Discard()
 	if err := txn.Set(k, v); err == badger.ErrTxnTooBig {
+		fmt.Printf(".")
 		if err := txn.Commit(); err != nil {
 			return false, err
 		}
@@ -148,6 +150,7 @@ func badgerWrite(b *badger.DB, k []byte, v []byte) (bool, error) {
 			return false, err
 		}
 	}
+	txn.Commit()
 	return true, nil
 }
 
@@ -226,9 +229,8 @@ func getTotalBenes(db *pgxpool.Pool, logger *log.Logger, cfg *Config) (uint64, e
 
 // builds (or continues building) the queue of bene id's
 func buildQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Logger) error {
-
+	fmt.Println("building the queue.")
 	var totalBenes uint64
-	// var numLeft uint64
 	totalBenes, err := getTotalBenes(db, logger, cfg)
 	if err != nil {
 		return err
@@ -328,12 +330,12 @@ func buildQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Log
 	}
 	p := message.NewPrinter(message.MatchLanguage("en")) // used to pretty print numbers
 	p.Printf("queue stats: %v benes of %v in the queue.\n", entryCount, totalBenes)
-	fmt.Printf("%v benes were missed\n", numLeft)
 	numLeft = totalBenes - entryCount
 	if numLeft > 0 {
-		fmt.Printf("missing benes.. replaying.\n---\n")
+		fmt.Printf("%v benes were missed. replaying.\n\n", numLeft)
 		buildQueue(db, queue, cfg, logger)
 	}
+	fmt.Printf("done.\n\n")
 	return nil
 }
 
@@ -388,8 +390,8 @@ func queueWorker(id int, db *pgxpool.Pool, queue *badger.DB, batches <-chan *que
 	}
 }
 
-// proccessing the queue for benes to cleanup
-func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Logger, dupCounter *uint64) error {
+// run dedup process
+func processDups(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Logger, dupCounter *uint64) error {
 	// determine how many benes need to be processed
 	qCount, doneCount, _, err := badgerStatus(queue)
 	if err != nil {
@@ -402,10 +404,6 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 	if numLeft < 1 {
 		return nil
 	}
-
-	// display stats
-	p := message.NewPrinter(message.MatchLanguage("en"))
-	p.Printf("queue stats: %v bene's in queue - %v completed - %v remain.\n", qCount, doneCount, numLeft)
 
 	// determine how many workers to use
 	var numDupWorkers int
@@ -431,7 +429,7 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 	bar.ShowPercent = true
 	bar.ShowBar = true
 	bar.ShowCounters = true
-	bar.ShowTimeLeft = true
+	bar.ShowTimeLeft = false
 	go func() {
 		for <-dupDoneChan {
 			if barStart == false {
@@ -443,7 +441,7 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 	}()
 
 	// launch the dup workers
-	fmt.Printf("spawning %v dup workers.\n", numDupWorkers)
+	fmt.Printf("spawning %v dedup workers.\n", numDupWorkers)
 	var beneChan = make(chan *beneEntry, dupBuffer)
 	var wg sync.WaitGroup
 	for i := 0; i < numDupWorkers; i++ {
@@ -451,23 +449,22 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 		go dupWorker(i, queue, beneChan, db, logger, cfg, dupDoneChan, dupCounter, &wg, &numLeft)
 	}
 
-	// run garbage collection on the queue and send unprocessed benes to the workers
+	// run garbage collections and flush the queue to disk before we hammer it
+	runtime.GC()
 	queue.RunValueLogGC(0.5)
-	fmt.Println("processing queue.")
+	fmt.Println("deduping.")
 	err = queue.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
-			item := it.Item()
-			var status string
-			err := item.Value(func(v []byte) error {
-				status = string(v)
+			err := it.Item().Value(func(v []byte) error {
+				status := string(v)
 				if status == "" || status == "2" {
 					var bene beneEntry
-					bene.key = item.KeyCopy(nil)
-					bene.value = v
+					bene.key = it.Item().KeyCopy(nil)
+					bene.value = []byte(status)
 					beneChan <- &bene
 				}
 				return nil
@@ -476,7 +473,8 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 				return err
 			}
 		}
-		return err
+		it.Close()
+		return nil
 	})
 	if err != nil {
 		logger.Println("error processing dups")
@@ -484,26 +482,19 @@ func processQueue(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.L
 	}
 	close(beneChan)
 	wg.Wait()
+	bar.Increment()
 	finMsg := fmt.Sprintf("%v duplicates were deleted.", *dupCounter)
 	bar.FinishPrint(finMsg)
 
 	// make sure everyone was processed.. replay until they are.
-	queue.RunValueLogGC(0.5)
-	queue.Sync()
 	qCount, doneCount, _, err = badgerStatus(queue)
 	if err != nil {
-		logger.Println("error getting queue status")
 		return err
 	}
 	if (qCount - doneCount) != 0 {
 		fmt.Printf("replaying missed benes.\n")
-		processQueue(db, queue, cfg, logger, dupCounter)
+		processDups(db, queue, cfg, logger, dupCounter)
 	}
-
-	// display stats
-	numLeft = qCount - doneCount
-	p.Printf("queue stats: %v bene's in queue - %v completed - %v remain.\n", qCount, doneCount, numLeft)
-
 	return nil
 }
 
@@ -531,35 +522,32 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *beneEntry, db *pgxpool
 
 		// update the bene
 		var newStatus string
-		switch bene.Value() {
-		case "2":
-			// mbi hash has been completed. set to both.
+		if bene.Key() == "2" {
 			newStatus = "3"
-		default:
-			// mark dedup as done
+		} else {
 			newStatus = "1"
 		}
-		_, err = badgerWrite(queue, bene.key, []byte(newStatus))
-		if err != nil {
-			// just log the error.. we will replay if missed
+		ok, err := badgerWrite(queue, bene.key, []byte(newStatus))
+		if !ok {
+			conn.Release()
 			logger.Println(err)
+			continue
 		}
-		conn.Release()
-
-		// update progress
-		dupDoneChan <- true
 
 		// update stats
 		atomic.AddUint64(numLeft, ^uint64(0))
 		if rowsDeleted > 0 {
 			atomic.AddUint64(dupCounter, uint64(rowsDeleted))
 		}
+
+		// update progress
+		dupDoneChan <- true
+		conn.Release()
 	}
 }
 
-func resetQueue(logger *log.Logger, queue *badger.DB) {
-	fmt.Println("Warning! Resetting all benes in the queue to nil. This will reset the status of each bene in the queue to nil.")
-	fmt.Println("This process will take some time and there is no progress meter. Type 'yes' to continue.")
+func resetQueue(db *pgxpool.Pool, logger *log.Logger, queue *badger.DB, cfg *Config) error {
+	fmt.Println("Warning! This will delete and rebuild the queue. Type 'yes' to continue.")
 	var response string
 	_, err := fmt.Scanln(&response)
 	if err != nil {
@@ -572,24 +560,28 @@ func resetQueue(logger *log.Logger, queue *badger.DB) {
 		fmt.Println("aborting.")
 		os.Exit(0)
 	}
-	err = queue.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		it := txn.NewIterator(opts)
-		defer it.Close()
-		for it.Rewind(); it.Valid(); it.Next() {
-			badgerWrite(queue, it.Item().Key(), nil)
-		}
-		return nil
-	})
-	if err != nil {
-		logger.Println("error processing dups")
-		logger.Fatal(err)
+	queue.DropAll()
+	if err := buildQueue(db, queue, cfg, logger); err != nil {
+		return err
 	}
-	qCount, doneCount, _, err := badgerStatus(queue)
-	numBenesToProcess := (qCount - doneCount)
-	p := message.NewPrinter(message.MatchLanguage("en")) // used to print numbers with comma's
-	p.Printf("queue stats: %v bene's in queue - %v completed - %v remain.\n", qCount, doneCount, numBenesToProcess)
+	queue.RunValueLogGC(1)
+	return nil
+}
+
+func displayQueueStats(queue *badger.DB) error {
+	// get queue stats
+	qCount, dupCount, mbiCount, err := badgerStatus(queue)
+	if err != nil {
+		fmt.Println("error getting stats")
+		return err
+	}
+	dupRemain := qCount - dupCount
+	mbiRemain := qCount - mbiCount
+	p := message.NewPrinter(message.MatchLanguage("en")) // pretty print numbers
+	p.Printf("there are %v benes in the queue.\n", qCount)
+	p.Printf("%v have been deduped. %v remain.\n", dupCount, dupRemain)
+	p.Printf("%v have had their mbi hashes checked/processed. %v remain.\n", mbiCount, mbiRemain)
+	return nil
 }
 
 func main() {
@@ -617,13 +609,6 @@ func main() {
 	}
 	defer db.Close()
 	fmt.Println("connected to fhir db.")
-
-	// parse flags
-	buildQueueFlag := flag.Bool("build-queue", false, "build the queue")
-	processQueueFlag := flag.Bool("process-queue", false, "process the queue")
-	resetQueueFlag := flag.Bool("reset-queue", false, "resets all benes to 'unprocessed'")
-	statsFlag := flag.Bool("stats", false, "display queue stats")
-	flag.Parse()
 
 	// badger steals stdout/err breaking progress bars.. let's prevent that by passing it a pipe instead
 	oldStdout := os.Stdout
@@ -654,16 +639,27 @@ func main() {
 	os.Stdout = oldStdout
 	<-stdOutChan //so just ignore
 
+	// parse flags
+	flag.CommandLine.SetOutput(os.Stdout)
+	buildQueueFlag := flag.Bool("build-queue", false, "build the queue")
+	processDupsFlag := flag.Bool("process-dups", false, "run dedup process")
+	resetQueueFlag := flag.Bool("reset-queue", false, "resets all benes to an unprocessed state")
+	statsFlag := flag.Bool("stats", false, "display queue stats")
+	flag.Parse()
+
 	// if no flags, show stats and exit
-	if *buildQueueFlag != true && *processQueueFlag != true && *resetQueueFlag != true && *statsFlag != true {
+	if *buildQueueFlag != true && *processDupsFlag != true && *resetQueueFlag != true && *statsFlag != true {
 		fmt.Println("nothing to do.")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	// reset the queue (mark benes nil)
+	// rebuild/reset the queue
 	if *resetQueueFlag {
-		resetQueue(logger, queue)
+		err := resetQueue(db, logger, queue, &cfg)
+		if err != nil {
+			logger.Fatal(err)
+		}
 	}
 
 	// build the queue
@@ -672,34 +668,23 @@ func main() {
 		if err != nil {
 			logger.Fatal(err)
 		}
-		fmt.Println("build queue complete.")
 	}
 
-	// process the queue
-	if *processQueueFlag == true {
+	// process the queue for dups
+	if *processDupsFlag == true {
 		// used to track progress on replays
-		err := processQueue(db, queue, &cfg, logger, &dupCounter)
+		err := processDups(db, queue, &cfg, logger, &dupCounter)
 		if err != nil {
 			logger.Fatal(err)
 		}
-		fmt.Println("processing duplicates complete.")
 	}
 
 	// display queue stats
 	if *statsFlag == true {
-		// get queue stats
-		fmt.Println("gathering stats")
-		qCount, dupCount, mbiCount, err := badgerStatus(queue)
-		if err != nil {
-			fmt.Println("error getting stats")
-			os.Exit(1)
+		fmt.Println("gathering stats.")
+		if err := displayQueueStats(queue); err != nil {
+			logger.Fatal(err)
 		}
-		dupRemain := qCount - dupCount
-		mbiRemain := qCount - mbiCount
-		p := message.NewPrinter(message.MatchLanguage("en")) // pretty print numbers
-		p.Printf("there are %v benes in the queue.\n", qCount)
-		p.Printf("%v of %v have been deduped.\n", dupCount, dupRemain)
-		p.Printf("%v of %v have had their mbi hashes checked/processed.\n", mbiCount, mbiRemain)
 		os.Exit(0)
 	}
 }
