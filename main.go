@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,70 +30,72 @@ import (
 
 // Config is loaded from environment. See .env file
 type Config struct {
-	RoDbHost          string `envconfig:"BH_RO_DB_HOST"`
-	RoDbPort          int    `envconfig:"BH_RO_DB_PORT"`
-	RoDbUser          string `envconfig:"BH_RO_DB_USER"`
-	RoDbPassword      string `envconfig:"BH_RO_DB_PASSWORD"`
-	RwDbHost          string `envconfig:"BH_RW_DB_HOST"`
-	RwDbPort          int    `envconfig:"BH_RW_DB_PORT"`
-	RwDbUser          string `envconfig:"BH_RW_DB_USER"`
-	RwDbPassword      string `envconfig:"BH_RW_DB_PASSWORD"`
-	DbName            string `envconfig:"BH_DB_NAME"`
-	DbMaxConns        int    `envconfig:"BH_DB_MAX_CONNS"`
-	HistoryTableName  string `envconfig:"BH_DB_HISTORY_TABLE_NAME"`
-	HistoryTableRows  uint64 `envconfig:"BH_DB_HISTORY_TABLE_ROWS"`
-	BeneTableRows     uint64 `envconfig:"BH_DB_BENE_TABLE_ROWS"`
-	NumQueueWorkers   int    `envconfig:"BH_NUM_QUEUE_WORKERS"`
-	QueueFeedLimit    uint64 `envconfig:"BH_QUEUE_FEED_LIMIT"`
-	QueueBuffer       uint64 `envconfig:"BH_QUEUE_BUFFER"`
-	NumDupWorkers     int    `envconfig:"BH_NUM_DUP_WORKERS"`
-	DupBuffer         int    `envconfig:"BH_DUP_BUFFER"`
-	NumMbiHashWorkers int    `envconfig:"BH_MBI_NUM_HASH_WORKERS"`
-	MbiHashBuffer     int    `envconfig:"BH_MBI_HASH_BUFFER"`
-	MbiHashPepper     string `envconfig:"BH_MBI_HASH_PEPPER"`
-	MbiHashIterations int    `envconfig:"BH_MBI_HASH_ITERATIONS"`
-	MbiHashLength     int    `envconfig:"BH_MBI_HASH_LENGTH"`
+	RoDbHost            string `envconfig:"BH_RO_DB_HOST"`
+	RoDbPort            int    `envconfig:"BH_RO_DB_PORT"`
+	RoDbUser            string `envconfig:"BH_RO_DB_USER"`
+	RoDbPassword        string `envconfig:"BH_RO_DB_PASSWORD"`
+	RwDbHost            string `envconfig:"BH_RW_DB_HOST"`
+	RwDbPort            int    `envconfig:"BH_RW_DB_PORT"`
+	RwDbUser            string `envconfig:"BH_RW_DB_USER"`
+	RwDbPassword        string `envconfig:"BH_RW_DB_PASSWORD"`
+	DbName              string `envconfig:"BH_DB_NAME"`
+	DbMaxConns          int32  `envconfig:"BH_DB_MAX_CONNS"`
+	BeneTableRows       uint64 `envconfig:"BH_DB_BENE_TABLE_ROWS"`
+	MissingMbiTableRows uint64 `envconfig:"BH_DB_MISSING_MBI_TABLE_ROWS"`
+	NumQueueWorkers     int    `envconfig:"BH_NUM_QUEUE_WORKERS"`
+	QueueFeedLimit      uint64 `envconfig:"BH_QUEUE_FEED_LIMIT"`
+	QueueBuffer         uint64 `envconfig:"BH_QUEUE_BUFFER"`
+	NumDupWorkers       int    `envconfig:"BH_NUM_DUP_WORKERS"`
+	DupBuffer           int    `envconfig:"BH_DUP_BUFFER"`
+	NumMbiHashWorkers   int    `envconfig:"BH_MBI_NUM_HASH_WORKERS"`
+	MbiHashBuffer       int    `envconfig:"BH_MBI_HASH_BUFFER"`
+	MbiHashPepper       string `envconfig:"BH_MBI_HASH_PEPPER"`
+	MbiHashIterations   int    `envconfig:"BH_MBI_HASH_ITERATIONS"`
+	MbiHashLength       int    `envconfig:"BH_MBI_HASH_LENGTH"`
 }
 
-// queueBatch represents the sql our queue workers will process to find unique bene id's
-// e.g., 'select foo from bigtable offset 1000 limit 1000'. The limit (how many rows per
-// batch to process) is configured via the environment variable BH_QUEUE_FEED_LIMIT. The
-// offset is used as a sort of pagination.
+// queueBatches are used to paginate through the database to build the queue.
+// e.g., 'select foo from bigtable offset 1000 limit 1000', '... offset 2000 limit 1000', and so on
 type queueBatch struct {
 	Offset uint64
 	Limit  uint64
 }
 
+// beneEntry represents an entry in the queue. `.key` and `.value` are []byte's.
+// `.Key()` and `.Value()` returns those values as strings
 type beneEntry struct {
 	key   []byte
 	value []byte
 }
 
-// return the key as a string
+// return .key and .value as strings
 func (b beneEntry) Key() string {
 	return string(b.key)
 }
-
-// return the value as a string
 func (b beneEntry) Value() string {
 	return string(b.value)
+}
+func (b beneEntry) Update(queue *badger.DB) (bool, error) {
+	ok, err := badgerWrite(queue, b.key, b.value)
+	return ok, err
+}
+func (b beneEntry) New(queue *badger.DB) (bool, error) {
+	ok, err := badgerWrite(queue, b.key, nil)
+	return ok, err
 }
 
 // used by missing mbi hash workers
 type hashBatch struct {
-	beneHistoryID string
+	beneHistoryID int64
 	mbiHash       string
 }
 
 // missing mbi hash patterns
 const (
-	missingMbiPattern      = `SELECT "beneficiaryHistoryId", "medicareBeneficiaryId" FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL AND "medicareBeneficiaryId" IS NOT NULL ORDER BY "beneficiaryHistoryId";`
+	missingMbiPattern      = `SELECT "beneficiaryHistoryId", "medicareBeneficiaryId" FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL;`
 	missingMbiCountPattern = `SELECT count(*) FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL AND "medicareBeneficiaryId" IS NOT NULL;`
 	updateHashPattern      = `UPDATE "BeneficiariesHistory" SET "mbiHash" = $1 WHERE "beneficiaryId" = $2 AND "beneficiaryHistoryId" = $3;`
 )
-
-// default number of workers adding benes to the queue. (keep this small to reduce lock contention in badger)
-const numQueueWorkersDefault = 3
 
 // queue query pattern (gets the bene id's into a local queue for later processing)
 const queuePattern = `SELECT "beneficiaryId" FROM "Beneficiaries" "beneficiaryId" ORDER BY "beneficiaryId" OFFSET $1 LIMIT $2;`
@@ -132,12 +133,8 @@ func freeMem() gosigar.Mem {
 	return mem
 }
 
-// convert bytes to mb
-func bToMb(b uint64) uint64 {
-	return b / 1024 / 1024
-}
-
-// badger read operation. Sets v to the value of k
+// badger read operation. Sets v to the value of k. e.g.,
+// err := badgerRead(queue, bene.key, bene.value) would set bene.value to v
 func badgerRead(b *badger.DB, k []byte, v []byte) error {
 	err := b.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(k)
@@ -154,7 +151,7 @@ func badgerRead(b *badger.DB, k []byte, v []byte) error {
 	return err
 }
 
-// badger write k with v.
+// badger write k with v. returns true/false and an err
 func badgerWrite(b *badger.DB, k []byte, v []byte) (bool, error) {
 	txn := b.NewTransaction(true)
 	defer txn.Discard()
@@ -205,13 +202,12 @@ func badgerStatus(b *badger.DB) (qCount uint64, dupCount uint64, mbiCount uint64
 	})
 	if err != nil {
 		dupCount, mbiCount, qCount = 0, 0, 0
-		return dupCount, mbiCount, qCount, err
 	}
 	return qCount, dupCount, mbiCount, err
 }
 
 // trap ctl-c, kill, etc and try to gracefully close badger (50/50 chance this will work, so try to let jobs finish and do not count on this.)
-// TODO: could use context package to gracefully handle it
+// TODO: we could use context package to handle this better
 func badgerCloseHandler(queue *badger.DB) {
 	c := make(chan os.Signal)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
@@ -447,7 +443,7 @@ func processDups(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Lo
 	bar.ShowPercent = true
 	bar.ShowBar = true
 	bar.ShowCounters = true
-	bar.ShowTimeLeft = false
+	bar.ShowTimeLeft = true
 	go func() {
 		for <-dupDoneChan {
 			if barStart == false {
@@ -471,7 +467,11 @@ func processDups(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Lo
 	runtime.GC()
 	queue.RunValueLogGC(0.5)
 
-	// send unduped benes to workers
+	// loop through the queue and send unduped benes to workers
+	// status 1 means dedup has been run
+	// status 2 means mbi hashes have been checked
+	// status 3 means both are done
+	// no status means nothing has been done
 	fmt.Println("deduping.")
 	err = queue.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -504,13 +504,13 @@ func processDups(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.Lo
 	wg.Wait()
 	finMsg := fmt.Sprintf("%v duplicates were deleted.", *dupCounter)
 	bar.FinishPrint(finMsg)
-
+	logger.Printf("%v duplicates were deleted.\n", *dupCounter)
 	// make sure everyone was processed.. replay until they are.
 	qCount, doneCount, _, err = badgerStatus(queue)
 	if err != nil {
 		return err
 	}
-	if (qCount - doneCount) != 0 {
+	if (qCount - doneCount) > 0 {
 		fmt.Printf("replaying missed benes.\n")
 		processDups(db, queue, cfg, logger, dupCounter)
 	}
@@ -523,6 +523,14 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *beneEntry, db *pgxpool
 	for bene := range beneChan {
 		bene := bene
 
+		// try to avoid going oom
+		for mem := freeMem(); mem.ActualFree < 1024; mem = freeMem() {
+			// cleanup and backoff
+			queue.RunValueLogGC(.5)
+			runtime.GC()
+			time.Sleep(time.Duration(5) * time.Second)
+		}
+
 		// grab a connection from the pool
 		conn, err := db.Acquire(context.Background())
 		if err != nil {
@@ -531,14 +539,20 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *beneEntry, db *pgxpool
 		defer conn.Release()
 
 		// delete the dups
-		result, err := conn.Exec(context.Background(), deletePattern, bene.Key())
+		txn, err := conn.Begin(context.Background())
+		result, err := txn.Exec(context.Background(), deletePattern, bene.Key())
 		if err != nil {
-			logger.Printf("%v", err)
-			logger.Printf("error deleting dups for %v.. skipping.\n", bene.Key())
+			txn.Rollback(context.Background())
+			conn.Release()
+			continue
+		}
+		if err := txn.Commit(context.Background()); err != nil {
+			txn.Rollback(context.Background())
 			conn.Release()
 			continue
 		}
 		rowsDeleted := result.RowsAffected()
+		conn.Release()
 
 		// update the bene
 		var newStatus string
@@ -562,7 +576,6 @@ func dupWorker(id int, queue *badger.DB, beneChan <-chan *beneEntry, db *pgxpool
 
 		// update progress
 		dupDoneChan <- true
-		conn.Release()
 	}
 }
 
@@ -606,6 +619,11 @@ func displayQueueStats(queue *badger.DB) error {
 
 // hashes mbi using PBKDF2-HMAC-SHA256 and sets *hashedMBI to the result
 func hashMBI(mbi []byte, hashedMBI *string, cfg *Config) error {
+	// make sure there is something to hash
+	if string(mbi) == "" {
+		return errors.New("null mbi passed to hashMBI function")
+	}
+
 	// decode the pepper from hex
 	pepper, err := hex.DecodeString(cfg.MbiHashPepper)
 	if err != nil {
@@ -698,7 +716,6 @@ func processHashes(db *pgxpool.Pool, queue *badger.DB, cfg *Config, logger *log.
 		go hashWorker(i, queue, beneChan, db, logger, cfg, &wg, hashDoneChan, hashCounter)
 	}
 
-	// process benes
 	fmt.Println("finding/updating missing mbi hashes.")
 	err = queue.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -741,6 +758,13 @@ func hashWorker(id int, queue *badger.DB, beneChan <-chan *beneEntry, db *pgxpoo
 	for bene := range beneChan {
 		bene := bene
 
+		// try to avoid going oom.. cleanup and backoff
+		for mem := freeMem(); mem.ActualFree < 1024; mem = freeMem() {
+			queue.RunValueLogGC(.5)
+			runtime.GC()
+			time.Sleep(time.Duration(5) * time.Second)
+		}
+
 		// get a connection from the pool
 		conn, err := db.Acquire(context.Background())
 		if err != nil {
@@ -752,62 +776,63 @@ func hashWorker(id int, queue *badger.DB, beneChan <-chan *beneEntry, db *pgxpoo
 
 		// look for missing mbi's (wrap in transaction)
 		txn, err := conn.Begin(context.Background())
+		defer txn.Rollback(context.Background())
+
 		rows, err := txn.Query(context.Background(), missingMbiPattern, bene.Key())
 		if err != nil {
-			txn.Rollback(context.Background())
 			logger.Println(err)
+			continue
 		}
 		defer rows.Close()
 
 		// parse results into a slice of hash batches
 		var hashQueue []hashBatch
-		var numHashes int
 		for rows.Next() {
 			// hash the mbi
-			var beneHistoryID string
+			var beneHistoryID int64
 			var mbi string
 			var mbiHash string
 			rows.Scan(&beneHistoryID, &mbi)
-			if err := hashMBI([]byte(mbi), &mbiHash, cfg); err != nil {
-				logger.Printf("error hashing mbi for %v bh id %v\n", bene.Key(), beneHistoryID)
-				txn.Rollback(context.Background())
+			if mbi == "" {
 				continue
+			}
+			if err := hashMBI([]byte(mbi), &mbiHash, cfg); err != nil {
+				logger.Fatalf("error hashing mbi for %v bh id %v\n", bene.Key(), beneHistoryID)
 			}
 
 			// add to the batch
 			batch := hashBatch{beneHistoryID: beneHistoryID, mbiHash: mbiHash}
 			hashQueue = append(hashQueue, batch)
-			numHashes++
 		}
-		txn.Commit(context.Background())
 		rows.Close()
-		conn.Release()
+		// conn.Release()
 
-		// update the record (had troubles executing more than one op in a txn)
-		conn, err = db.Acquire(context.Background())
-		if err != nil {
-			logger.Println(err)
-			conn.Release()
-			continue
-		}
-		defer conn.Release()
+		// update db if there are missing hashes
 
-		txn, err = conn.Begin(context.Background())
-		if err != nil {
-			logger.Fatal(err)
-		}
+		// grab another connection
+		// conn, err = db.Acquire(context.Background())
+		// if err != nil {
+		// 	logger.Println(err)
+		// 	continue
+		// }
+		// defer conn.Release()
+
+		// // wrap updates in a txn
+		// txn, err = conn.Begin(context.Background())
+		// if err != nil {
+		// 	logger.Println(err)
+		// 	continue
+		// }
+		// defer txn.Rollback(context.Background())
+
+		// loop through the hash queue and update sql db
 		for _, hash := range hashQueue {
-			beneid, _ := strconv.Atoi(hash.beneHistoryID) // undocumented, but it appears Atoi can handle int64 as well
-			result, err := txn.Exec(context.Background(), updateHashPattern, hash.mbiHash, bene.Key(), int64(beneid))
+			result, err := txn.Exec(context.Background(), updateHashPattern, hash.mbiHash, bene.Key(), hash.beneHistoryID)
 			if err != nil {
-				txn.Rollback(context.Background())
-				conn.Release()
-				logger.Println("error updating bene record after hashing.")
-				logger.Fatal(err)
+				logger.Println(err)
+				continue
 			}
-			if result.RowsAffected() > 0 {
-				atomic.AddUint64(hashCounter, uint64(numHashes))
-			}
+			atomic.AddUint64(hashCounter, uint64(result.RowsAffected()))
 		}
 		txn.Commit(context.Background())
 		conn.Release()
@@ -817,6 +842,7 @@ func hashWorker(id int, queue *badger.DB, beneChan <-chan *beneEntry, db *pgxpoo
 		if !ok {
 			logger.Println("error marking (mbi) bene complete. ignoring.")
 			logger.Println(err)
+			continue
 		}
 		hashDoneChan <- true
 	}
@@ -861,7 +887,7 @@ func main() {
 		stdOutChan <- buf.String()
 	}()
 
-	// open badger db
+	// open dup queue
 	queue, err := badger.Open(badger.DefaultOptions("cleanup.queue"))
 	if err != nil {
 		logger.Fatal(err)
@@ -920,14 +946,6 @@ func main() {
 		err := processHashes(db, queue, &cfg, logger, &hashCounter)
 		if err != nil {
 			logger.Fatal(err)
-		}
-		if *processDupsFlag {
-			// run the dedup process again after hashing
-			var dupCounter uint64
-			err := processDups(db, queue, &cfg, logger, &dupCounter)
-			if err != nil {
-				logger.Fatal(err)
-			}
 		}
 	}
 
