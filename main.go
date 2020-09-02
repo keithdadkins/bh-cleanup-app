@@ -277,16 +277,6 @@ func getTotalBenes() (uint64, error) {
 	return totalBenes, nil
 }
 
-// returns a db connection from the pool
-func dbConn() (*pgxpool.Conn, error) {
-	newConn, err := db.Acquire(context.Background())
-	if err != nil {
-		logger.Println(err)
-	}
-	defer newConn.Release()
-	return newConn, err
-}
-
 // delete and rebuild the queue
 func resetQueue() error {
 	fmt.Println("Warning! This will delete and rebuild the queue. Type 'yes' to continue.")
@@ -560,7 +550,7 @@ func processDups(dupCounter *uint64) error {
 			item := it.Item()
 			var bene beneEntry
 			bene.key = item.KeyCopy(nil)
-			// item.ValueSize is much faster than grabbing the value from the log
+			// item.ValueSize is much faster than grabbing the value from the log, so try that first
 			if item.ValueSize() > 0 {
 				// check the status
 				err := item.Value(func(v []byte) error {
@@ -705,7 +695,7 @@ func testHash(testmbi string, expected string, testCfg *Config) bool {
 	return result
 }
 
-// runs cleanup workers for each bene in the queue
+// process the queue for missing mbi hashes
 func processHashes(hashCounter *uint64) error {
 
 	// test hashing function
@@ -726,8 +716,8 @@ func processHashes(hashCounter *uint64) error {
 	}
 	var hashCost time.Duration
 	hashCost = ((t1Duration + t2Duration) / 2)
-	hashPerMil := hashCost * 1000000
-	fmt.Printf("mbi hashing will take around %v seconds per bene to process (around %v seconds per million)\n", hashCost.Seconds(), fmt.Sprintf("%s", hashPerMil))
+	hashPerMil := (hashCost * 1000000) / time.Duration(runtime.NumCPU())
+	fmt.Printf("mbi hashing will take around %v seconds per bene to process (around %v seconds per million with %v CPU's.)\n", hashCost.Seconds(), fmt.Sprintf("%s", hashPerMil), runtime.NumCPU())
 
 	// determine how many workers to use
 	var numHashWorkers int
@@ -812,7 +802,7 @@ func processHashes(hashCounter *uint64) error {
 	return nil
 }
 
-// updates missing mbi hashes for each bene sent from processHashes()
+// checks/updates missing mbi hashes for each bene sent from processHashes()
 func hashWorker(id int, beneChan <-chan *beneEntry, wg *sync.WaitGroup, hashDoneChan chan<- bool, hashCounter *uint64) {
 	defer wg.Done()
 	for bene := range beneChan {
@@ -825,69 +815,75 @@ func hashWorker(id int, beneChan <-chan *beneEntry, wg *sync.WaitGroup, hashDone
 			time.Sleep(time.Duration(5) * time.Second)
 		}
 
-		// get a connection from the pool
-		conn, err := dbConn()
-
-		// look for missing mbi's (wrap in transaction)
-		txn, err := conn.Begin(context.Background())
-		defer txn.Rollback(context.Background())
-
-		rows, err := txn.Query(context.Background(), missingMbiPattern, bene.Key())
+		// look for missing mbi's
+		rows, err := db.Query(context.Background(), missingMbiPattern, bene.Key())
 		if err != nil {
-			logger.Println(err)
+			handleErr(err, "", nil, nil)
 			continue
 		}
 		defer rows.Close()
 
-		// parse results into a slice of hash batches
+		// append hash results to []hashQueue
 		var hashQueue []hashBatch
 		for rows.Next() {
 			// hash the mbi
 			var beneHistoryID int64
-			var mbi string
+			var medicareBenecificaryID []byte
 			var mbiHash string
-			rows.Scan(&beneHistoryID, &mbi)
+			rows.Scan(&beneHistoryID, &medicareBenecificaryID)
+			mbi := string(medicareBenecificaryID)
 			if mbi == "" {
+				// no medicareBenecificaryId to hash
 				continue
 			}
-			if err := hashMBI([]byte(mbi), &mbiHash, &cfg); err != nil {
-				logger.Fatalf("error hashing mbi for %v bh id %v\n", bene.Key(), beneHistoryID)
+			err := hashMBI([]byte(mbi), &mbiHash, &cfg)
+			if err != nil {
+				logger.Fatal(err)
 			}
-
 			// add to the batch
 			batch := hashBatch{beneHistoryID: beneHistoryID, mbiHash: mbiHash}
 			hashQueue = append(hashQueue, batch)
 		}
 		rows.Close()
 
-		// loop through the hash queue and update the bene history table
+		// grab a connection from the pool
+		conn, err := db.Acquire(context.Background())
+		handleErr(err, "pools empty", nil, nil)
+		defer conn.Release()
+
+		// start a transaction
+		txn, err := conn.Begin(context.Background())
+		defer txn.Rollback(context.Background())
+
+		// loop through []hashQueue and update the bene history table
 		for _, hash := range hashQueue {
+			// UPDATE "BeneficiariesHistory" SET "mbiHash" = $1 WHERE "beneficiaryId" = $2 AND "beneficiaryHistoryId" = $3;
 			result, err := txn.Exec(context.Background(), updateHashPattern, hash.mbiHash, bene.Key(), hash.beneHistoryID)
-			handleErr(err, "", txn, conn)
-			atomic.AddUint64(hashCounter, uint64(result.RowsAffected()))
+			if err != nil {
+				handleErr(err, "", txn, conn)
+				continue
+			}
+			if result.RowsAffected() > 0 {
+				atomic.AddUint64(hashCounter, uint64(result.RowsAffected()))
+			}
+		}
+		if err := txn.Commit(context.Background()); err != nil {
+			fmt.Println("error commit transaction")
 		}
 
-		// mark bene as done
-		oldStatus := bene.status
+		// update queue status
 		switch bene.Status() {
 		case "1":
 			bene.status = []byte("3")
 		default:
 			bene.status = []byte("2")
 		}
-
 		ok, err := bene.Update()
 		if !ok {
 			handleErr(err, "error marking bene complete", nil, conn)
 			continue
 		}
-		err = txn.Commit(context.Background())
-		if err != nil {
-			// undo
-			bene.status = oldStatus
-			bene.Update()
-			handleErr(err, "error commiting hash update to db", txn, conn)
-		}
+
 		conn.Release()
 		hashDoneChan <- true
 	}
