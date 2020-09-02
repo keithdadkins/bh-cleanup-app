@@ -96,6 +96,7 @@ var (
 	queue  *badger.DB    // pointer to our badger db (aka 'the queue')
 	db     *pgxpool.Pool // pointer to our postgres db
 	cfg    Config        // config is loaded from env vars starting with 'BH_'
+	force  bool          // -f flag to force processing the bene no matter their current status
 )
 
 // used by missing mbi hash workers
@@ -290,7 +291,7 @@ func resetQueue() error {
 		fmt.Println("resetting.")
 	default:
 		fmt.Println("aborting.")
-		os.Exit(0)
+		os.Exit(1)
 	}
 	queue.DropAll()
 	if err := buildQueue(); err != nil {
@@ -487,8 +488,15 @@ func processDups(dupCounter *uint64) error {
 	}
 	numLeft := qCount - doneCount
 
+	// do them all if -force
+	if force == true {
+		numLeft = qCount
+	}
+
 	// quit if done
 	if numLeft < 1 {
+		fmt.Println("all benes have been processed.")
+		_ = displayQueueStats()
 		return nil
 	}
 
@@ -550,6 +558,13 @@ func processDups(dupCounter *uint64) error {
 			item := it.Item()
 			var bene beneEntry
 			bene.key = item.KeyCopy(nil)
+
+			// run them all all if -force
+			if force == true {
+				beneChan <- &bene
+				continue
+			}
+
 			// item.ValueSize is much faster than grabbing the value from the log, so try that first
 			if item.ValueSize() > 0 {
 				// check the status
@@ -616,28 +631,27 @@ func dupWorker(id int, beneChan <-chan *beneEntry, dupDoneChan chan<- bool, dupC
 		handleErr(err, "pools empty", nil, nil)
 		defer conn.Release()
 
-		// run in a separate function to prevent orphaned defers (causing a memory leak)
-		ok := func() bool {
-			// start a transaction
-			txn, err := conn.Begin(context.Background())
-			handleErr(err, "txn err", txn, conn)
+		// start a transaction
+		txn, err := conn.Begin(context.Background())
+		handleErr(err, "txn err", txn, conn)
 
-			// delete the dups
-			result, err := txn.Exec(context.Background(), deletePattern, bene.Key())
-			if err != nil {
-				handleErr(err, "could not run delete query", txn, conn)
-				return false
-			}
+		// delete the dups
+		result, err := txn.Exec(context.Background(), deletePattern, bene.Key())
+		if err != nil {
+			handleErr(err, "could not run delete query", txn, conn)
+			continue
+		}
 
-			// commit
-			err = txn.Commit(context.Background())
-			if err != nil {
-				handleErr(err, "could not commit", txn, conn)
-				return false
-			}
-			rowsDeleted := result.RowsAffected()
+		// commit
+		err = txn.Commit(context.Background())
+		if err != nil {
+			handleErr(err, "could not commit", txn, conn)
+			continue
+		}
+		rowsDeleted := result.RowsAffected()
 
-			// update the bene
+		// update the bene
+		if force == false {
 			switch bene.Status() {
 			case "":
 				bene.status = []byte("1")
@@ -647,19 +661,16 @@ func dupWorker(id int, beneChan <-chan *beneEntry, dupDoneChan chan<- bool, dupC
 			ok, err := bene.Update()
 			if !ok {
 				handleErr(err, "error updating bene status", nil, conn)
-				return false
+				continue
 			}
-
-			// update stats
-			atomic.AddUint64(numLeft, ^uint64(0))
-			if rowsDeleted > 0 {
-				atomic.AddUint64(dupCounter, uint64(rowsDeleted))
-			}
-			return true
-		}()
-		if !ok {
-			continue
 		}
+
+		// update stats
+		atomic.AddUint64(numLeft, ^uint64(0))
+		if rowsDeleted > 0 {
+			atomic.AddUint64(dupCounter, uint64(rowsDeleted))
+		}
+
 		// update progress
 		dupDoneChan <- true
 		conn.Release()
@@ -719,6 +730,20 @@ func processHashes(hashCounter *uint64) error {
 	hashPerMil := (hashCost * 1000000) / time.Duration(runtime.NumCPU())
 	fmt.Printf("mbi hashing will take around %v seconds per bene to process (around %v seconds per million with %v CPU's.)\n", hashCost.Seconds(), fmt.Sprintf("%s", hashPerMil), runtime.NumCPU())
 
+	qCount, _, mbiCount, err := badgerStatus()
+	handleErr(err, "", nil, nil)
+	numLeft := qCount - mbiCount
+
+	if force {
+		numLeft = qCount
+	}
+
+	if numLeft == 0 {
+		fmt.Println("all benes have been checked.")
+		displayQueueStats()
+		return nil
+	}
+
 	// determine how many workers to use
 	var numHashWorkers int
 	if cfg.NumMbiHashWorkers > 0 {
@@ -736,8 +761,6 @@ func processHashes(hashCounter *uint64) error {
 	}
 
 	// progress bar
-	qCount, _, mbiCount, err := badgerStatus()
-	numLeft := qCount - mbiCount
 	count := int64(numLeft)
 	bar := pb.New64(count)
 	hashDoneChan := make(chan bool, 1)
@@ -777,7 +800,7 @@ func processHashes(hashCounter *uint64) error {
 				var bene beneEntry
 				bene.key = it.Item().KeyCopy(nil)
 				bene.status = v
-				if bene.Status() == "" || bene.Status() == "1" {
+				if bene.Status() == "" || bene.Status() == "1" || force == true {
 					beneChan <- &bene
 				}
 				return nil
@@ -871,17 +894,19 @@ func hashWorker(id int, beneChan <-chan *beneEntry, wg *sync.WaitGroup, hashDone
 			fmt.Println("error commit transaction")
 		}
 
-		// update queue status
-		switch bene.Status() {
-		case "1":
-			bene.status = []byte("3")
-		default:
-			bene.status = []byte("2")
-		}
-		ok, err := bene.Update()
-		if !ok {
-			handleErr(err, "error marking bene complete", nil, conn)
-			continue
+		if force == false {
+			// update queue status
+			switch bene.Status() {
+			case "1":
+				bene.status = []byte("3")
+			default:
+				bene.status = []byte("2")
+			}
+			ok, err := bene.Update()
+			if !ok {
+				handleErr(err, "error marking bene complete", nil, conn)
+				continue
+			}
 		}
 
 		conn.Release()
@@ -938,7 +963,7 @@ func main() {
 	// close the pipe and go back to normal stdout. badger really only writes to stderr anyway.
 	w.Close()
 	os.Stdout = oldStdout
-	<-stdOutChan //so just ignore
+	<-stdOutChan
 
 	// parse flags
 	flag.CommandLine.SetOutput(os.Stdout)
@@ -947,8 +972,14 @@ func main() {
 	processHashesFlag := flag.Bool("process-hashes", false, "update missing mbi hashes.")
 	resetQueueFlag := flag.Bool("reset-queue", false, "resets all benes to an unprocessed state")
 	statsFlag := flag.Bool("stats", false, "display queue stats")
+	forceFlag := flag.Bool("force", false, "process the bene no matter their current status")
 	flagged := false
 	flag.Parse()
+
+	// force
+	if *forceFlag {
+		force = true
+	}
 
 	// rebuild/reset the queue
 	if *resetQueueFlag {
