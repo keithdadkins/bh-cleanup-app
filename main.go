@@ -138,6 +138,12 @@ func (b beneEntry) Status() string {
 	return string(b.status)
 }
 
+// Sets bene.status to the current value from the queue.
+func (b beneEntry) GetStatus() error {
+	err := badgerRead(b.key, b.status)
+	return err
+}
+
 // updates the benes status in the queue
 func (b beneEntry) Update() (bool, error) {
 	ok, err := badgerWrite(b.key, b.status)
@@ -372,8 +378,8 @@ func buildQueue() error {
 	bar.ShowPercent = true
 	bar.ShowBar = true
 	bar.ShowCounters = true
-	bar.ShowTimeLeft = true
-	bar.ShowElapsedTime = true
+	bar.ShowTimeLeft = false
+	bar.ShowElapsedTime = false
 	go func() {
 		for num := range batchDoneChan {
 			if barStart == false {
@@ -453,8 +459,8 @@ func queueWorker(id int, batches <-chan *queueBatch, wg *sync.WaitGroup, numLeft
 			if err != nil {
 				logger.Fatal(err)
 			}
-			err = badgerRead(bene.key, bene.status)
-			if err != nil {
+			bene.GetStatus()
+			if bene.Status() == "" {
 				benesToProcess = append(benesToProcess, bene)
 			}
 		}
@@ -463,11 +469,17 @@ func queueWorker(id int, batches <-chan *queueBatch, wg *sync.WaitGroup, numLeft
 		// process the results
 		txn := queue.NewTransaction(true)
 		for _, bene := range benesToProcess {
-			key := bene.key
-			if err := txn.Set(key, nil); err == badger.ErrTxnTooBig {
-				_ = txn.Commit()
-				txn = queue.NewTransaction(true)
-				_ = txn.Set(key, nil)
+			// add the bene to the queue
+			if err := txn.Set(bene.key, nil); err == badger.ErrTxnTooBig {
+				err = txn.Commit()
+				if err != nil {
+					// try again with new transaction
+					txn = queue.NewTransaction(true)
+					_ = txn.Set(bene.key, nil)
+					if err := txn.Commit(); err != nil {
+						logger.Fatal("could not update bene")
+					}
+				}
 			}
 			rowsDone++
 		}
@@ -538,7 +550,7 @@ func processDups(dupCounter *uint64) error {
 
 	// launch the dup workers
 	fmt.Printf("spawning %v dedup workers.\n", numDupWorkers)
-	var beneChan = make(chan *beneEntry, dupBuffer)
+	var beneChan = make(chan beneEntry, dupBuffer)
 	var wg sync.WaitGroup
 	for i := 0; i < numDupWorkers; i++ {
 		wg.Add(1)
@@ -562,7 +574,7 @@ func processDups(dupCounter *uint64) error {
 
 			// run them all all if -force
 			if force == true {
-				beneChan <- &bene
+				beneChan <- bene
 				continue
 			}
 
@@ -572,7 +584,7 @@ func processDups(dupCounter *uint64) error {
 				err := item.Value(func(v []byte) error {
 					bene.status = v
 					if bene.Status() == "" || bene.Status() == "2" {
-						beneChan <- &bene
+						beneChan <- bene
 					}
 					return nil
 				})
@@ -581,7 +593,7 @@ func processDups(dupCounter *uint64) error {
 				}
 			} else {
 				// unworked bene
-				beneChan <- &bene
+				beneChan <- bene
 			}
 
 		}
@@ -614,7 +626,7 @@ func processDups(dupCounter *uint64) error {
 }
 
 // dedups benes sent from processDups()
-func dupWorker(id int, beneChan <-chan *beneEntry, dupDoneChan chan<- bool, dupCounter *uint64, wg *sync.WaitGroup, numLeft *uint64) {
+func dupWorker(id int, beneChan <-chan beneEntry, dupDoneChan chan<- bool, dupCounter *uint64, wg *sync.WaitGroup, numLeft *uint64) {
 	// handle benes received on the beneChan
 	for bene := range beneChan {
 		bene := bene
@@ -782,7 +794,7 @@ func processHashes(hashCounter *uint64) error {
 
 	// launch the Hash workers
 	fmt.Printf("spawning %v workers.\n", numHashWorkers)
-	var beneChan = make(chan *beneEntry, hashBuffer)
+	var beneChan = make(chan beneEntry, hashBuffer)
 	var wg sync.WaitGroup
 	var i int
 	for i = 0; i < numHashWorkers; i++ {
@@ -802,7 +814,7 @@ func processHashes(hashCounter *uint64) error {
 				bene.key = it.Item().KeyCopy(nil)
 				bene.status = v
 				if bene.Status() == "" || bene.Status() == "1" || force == true {
-					beneChan <- &bene
+					beneChan <- bene
 				}
 				return nil
 			})
@@ -827,7 +839,7 @@ func processHashes(hashCounter *uint64) error {
 }
 
 // checks/updates missing mbi hashes for each bene sent from processHashes()
-func hashWorker(id int, beneChan <-chan *beneEntry, wg *sync.WaitGroup, hashDoneChan chan<- bool, hashCounter *uint64) {
+func hashWorker(id int, beneChan <-chan beneEntry, wg *sync.WaitGroup, hashDoneChan chan<- bool, hashCounter *uint64) {
 	defer wg.Done()
 	// used to log a few beneficiariesHistoryId's were mbi hashes were generated for later verification. to grep the entries, run:
 	// $> grep "VERIFY_HASH" log
