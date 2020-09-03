@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -828,6 +829,10 @@ func processHashes(hashCounter *uint64) error {
 // checks/updates missing mbi hashes for each bene sent from processHashes()
 func hashWorker(id int, beneChan <-chan *beneEntry, wg *sync.WaitGroup, hashDoneChan chan<- bool, hashCounter *uint64) {
 	defer wg.Done()
+	// used to log a few beneficiariesHistoryId's were mbi hashes were generated for later verification. to grep the entries, run:
+	// $> grep "VERIFY_HASH" log
+	var hashSampleCounter int32
+
 	for bene := range beneChan {
 		bene := bene
 
@@ -887,6 +892,11 @@ func hashWorker(id int, beneChan <-chan *beneEntry, wg *sync.WaitGroup, hashDone
 				continue
 			}
 			if result.RowsAffected() > 0 {
+				// will log ~ one entry per worker for later verification
+				if hashSampleCounter < 1 {
+					logger.Println("VERIFY_HASH beneficiaryHistoryId: ", strconv.FormatInt(hash.beneHistoryID, 10))
+					atomic.AddInt32(&hashSampleCounter, 1)
+				}
 				atomic.AddUint64(hashCounter, uint64(result.RowsAffected()))
 			}
 		}
