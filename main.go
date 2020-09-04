@@ -92,6 +92,9 @@ WHERE
 WHERE dups.row > 1)
 DELETE FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "beneficiaryHistoryId" IN (SELECT "beneficiaryHistoryId" FROM x);`
 
+// run this when done to cleanup after all the deletes
+const vacuumPattern = `VACUUM ANALYZE`
+
 var (
 	logger *log.Logger   // pointer to our stderr logfile
 	queue  *badger.DB    // pointer to our badger db (aka 'the queue')
@@ -267,6 +270,16 @@ func badgerCloseHandler() {
 		}
 		os.Exit(0)
 	}()
+}
+
+// runs VACUUM ANALYZE on the db to free up space and update db stats
+func runVacuum() bool {
+	_, err := db.Exec(context.Background(), vacuumPattern)
+	if err != nil {
+		handleErr(err, "unable to execute vacuum", nil, nil)
+		return false
+	}
+	return true
 }
 
 // returns the total number of benes that should be in the queue
@@ -610,7 +623,7 @@ func processDups(dupCounter *uint64) error {
 	wg.Wait()
 	finMsg := fmt.Sprintf("%v duplicates were deleted.", *dupCounter)
 	bar.FinishPrint(finMsg)
-	logger.Printf("%v duplicates were deleted.\n", *dupCounter)
+	logger.Println("STAT: ", finMsg)
 
 	// replay?
 	qCount, doneCount, _, err = badgerStatus()
@@ -834,6 +847,7 @@ func processHashes(hashCounter *uint64) error {
 	bar.Increment()
 	finMsg := fmt.Sprintf("%v MBI hashes were updated.", *hashCounter)
 	bar.FinishPrint(finMsg)
+	logger.Println("STAT: ", finMsg)
 	fmt.Printf("done.\n\n")
 	return nil
 }
@@ -994,6 +1008,7 @@ func main() {
 	processHashesFlag := flag.Bool("process-hashes", false, "update missing mbi hashes.")
 	resetQueueFlag := flag.Bool("reset-queue", false, "resets all benes to an unprocessed state")
 	statsFlag := flag.Bool("stats", false, "display queue stats")
+	vacuumFlag := flag.Bool("vacuum", false, "runs 'VACUUM ANALYZE' on the db to free up space and update db statistics")
 	forceFlag := flag.Bool("force", false, "process the bene no matter their current status")
 	flagged := false
 	flag.Parse()
@@ -1049,7 +1064,17 @@ func main() {
 		if err := displayQueueStats(); err != nil {
 			logger.Fatal(err)
 		}
-		os.Exit(0)
+	}
+
+	// vacuum
+	if *vacuumFlag == true {
+		flagged = true
+		fmt.Println("running 'VACUUM ANALYZE'. This may take ~30 minutes or longer.")
+		if runVacuum() {
+			fmt.Println("done.")
+		} else {
+			os.Exit(1)
+		}
 	}
 
 	// no flags were passed
