@@ -45,3 +45,8 @@ jobs:
       with:
         name: bh-cleanup-app
         path: /home/runner/work/bh-cleanup-app/
+    - name: Upload macos artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: bh-cleanup-app
+        path: /Users/runner/work/bh-cleanup-app/ 
