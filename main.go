@@ -1010,6 +1010,9 @@ func main() {
 	statsFlag := flag.Bool("stats", false, "display queue stats")
 	vacuumFlag := flag.Bool("vacuum", false, "runs 'VACUUM ANALYZE' on the db to free up space and update db statistics")
 	forceFlag := flag.Bool("force", false, "process the bene no matter their current status")
+	verifyFlag := flag.Bool("verify", false, "verify mbi hash. must provide -mbi and -expected args. Returns true or false.")
+	mbiFlag := flag.String("mbi", "", "mbi used with -verify")
+	expectedFlag := flag.String("expected", "", "expected hash used with -verify")
 	flagged := false
 	flag.Parse()
 
@@ -1055,6 +1058,13 @@ func main() {
 		if err != nil {
 			logger.Fatal(err)
 		}
+	}
+
+	// verify mbi hash
+	if *verifyFlag == true {
+		flagged = true
+		fmt.Println(testHash(*mbiFlag, *expectedFlag, &cfg))
+		os.Exit(0)
 	}
 
 	// display queue stats
