@@ -276,7 +276,7 @@ func badgerCloseHandler() {
 	}()
 }
 
-// runs VACUUM ANALYZE on the db to free up space and update db stats
+// runs VACUUM FULL ANALYZE on the db to free up space and update db stats
 func runVacuum(all bool) bool {
 	// set a very long connection timeout for these operations.
 	db.Config().ConnConfig.ConnectTimeout = (time.Duration(2) * time.Hour)
@@ -301,7 +301,7 @@ func runVacuum(all bool) bool {
 
 			// vacuum analyze the table
 			fmt.Printf("vacuuming and analyzing %v... ", tableName)
-			stmt := fmt.Sprintf("VACUUM ANALYZE \"%v\";", tableName)
+			stmt := fmt.Sprintf("VACUUM FULL ANALYZE \"%v\";", tableName)
 			_, err := db.Exec(context.Background(), stmt)
 			if err != nil {
 				logger.Println(err)
@@ -311,7 +311,7 @@ func runVacuum(all bool) bool {
 		rows.Close()
 	} else {
 		// just run on "BeneficiariesHistory"
-		_, err := db.Exec(context.Background(), `VACUUM FULL "BeneficiariesHistory"`)
+		_, err := db.Exec(context.Background(), `VACUUM FULL ANALYZE "BeneficiariesHistory"`)
 		if err != nil {
 			handleErr(err, "unable to execute vacuum", nil, nil)
 			return false
@@ -1118,7 +1118,7 @@ func main() {
 	// vacuum
 	if *vacuumFlag == true {
 		flagged = true
-		fmt.Println("running a VACUUM FULL on the history table in order to reclaim disk space. This will take a very long time and should not be run on production.")
+		fmt.Println("running a full vacuum on the history table. This will take a long time and should not be run on production.")
 		if runVacuum(false) {
 			fmt.Println("done.")
 		} else {
@@ -1129,7 +1129,7 @@ func main() {
 	// vacuum all
 	if *vacuumAllFlag == true {
 		flagged = true
-		fmt.Println("running 'VACUUM ANALYZE' on each table in BFD. This will take a long time.")
+		fmt.Println("vacuuming/analyzing each table in BFD. This will take a while.")
 		if runVacuum(true) {
 			fmt.Println("done.")
 		} else {
