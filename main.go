@@ -56,6 +56,13 @@ type Config struct {
 	MbiHashLength       int    `envconfig:"BH_MBI_HASH_LENGTH"`
 }
 
+// vacuum-analyze patterns
+// run this when done to cleanup after all the deletes
+const (
+	bfdTablesPattern = `SELECT relname AS TableName	FROM pg_stat_user_tables;` // gets all the table names in bfd
+	vacuumPattern    = `VACUUM ANALYZE $1 ;`                                   // runs vacuum analyze on $1
+)
+
 // missing mbi hash patterns
 const (
 	missingMbiPattern      = `SELECT "beneficiaryHistoryId", "medicareBeneficiaryId" FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "mbiHash" IS NULL;`
@@ -91,9 +98,6 @@ WHERE
 ) dups 
 WHERE dups.row > 1)
 DELETE FROM "BeneficiariesHistory" WHERE "beneficiaryId" = $1 AND "beneficiaryHistoryId" IN (SELECT "beneficiaryHistoryId" FROM x);`
-
-// run this when done to cleanup after all the deletes
-const vacuumPattern = `VACUUM ANALYZE`
 
 var (
 	logger *log.Logger   // pointer to our stderr logfile
@@ -273,11 +277,45 @@ func badgerCloseHandler() {
 }
 
 // runs VACUUM ANALYZE on the db to free up space and update db stats
-func runVacuum() bool {
-	_, err := db.Exec(context.Background(), vacuumPattern)
-	if err != nil {
-		handleErr(err, "unable to execute vacuum", nil, nil)
-		return false
+func runVacuum(all bool) bool {
+	// set a very long connection timeout for these operations.
+	db.Config().ConnConfig.ConnectTimeout = (time.Duration(2) * time.Hour)
+
+	if all {
+		// query the db for table names
+		rows, err := db.Query(context.Background(), bfdTablesPattern)
+		if err != nil {
+			logger.Println("error fetching table names")
+			logger.Fatal(err)
+		}
+		defer rows.Close()
+
+		// parse the results
+		for rows.Next() {
+			var tableName string
+			err = rows.Scan(&tableName)
+			if err != nil {
+				logger.Println(err)
+				return false
+			}
+
+			// vacuum analyze the table
+			fmt.Printf("vacuuming and analyzing %v... ", tableName)
+			stmt := fmt.Sprintf("VACUUM ANALYZE \"%v\";", tableName)
+			_, err := db.Exec(context.Background(), stmt)
+			if err != nil {
+				logger.Println(err)
+			}
+			fmt.Println("done.")
+		}
+		rows.Close()
+	} else {
+		// just run on "BeneficiariesHistory"
+		_, err := db.Exec(context.Background(), `VACUUM FULL "BeneficiariesHistory"`)
+		if err != nil {
+			handleErr(err, "unable to execute vacuum", nil, nil)
+			return false
+		}
 	}
 	return true
 }
@@ -1008,7 +1046,8 @@ func main() {
 	processHashesFlag := flag.Bool("process-hashes", false, "update missing mbi hashes.")
 	resetQueueFlag := flag.Bool("reset-queue", false, "resets all benes to an unprocessed state")
 	statsFlag := flag.Bool("stats", false, "display queue stats")
-	vacuumFlag := flag.Bool("vacuum", false, "runs 'VACUUM ANALYZE' on the db to free up space and update db statistics")
+	vacuumFlag := flag.Bool("vacuum", false, "runs 'VACUUM ANALYZE' on BeneficiariesHistory table to free up space and update db statistics")
+	vacuumAllFlag := flag.Bool("vacuum-all", false, "runs VACUUM ANALYZE on each table in bfd")
 	forceFlag := flag.Bool("force", false, "process the bene no matter their current status")
 	verifyFlag := flag.Bool("verify", false, "verify mbi hash. must provide -mbi and -expected args. Returns true or false.")
 	mbiFlag := flag.String("mbi", "", "mbi used with -verify")
@@ -1079,8 +1118,19 @@ func main() {
 	// vacuum
 	if *vacuumFlag == true {
 		flagged = true
-		fmt.Println("running 'VACUUM ANALYZE'. This may take ~30 minutes or longer.")
-		if runVacuum() {
+		fmt.Println("running a VACUUM FULL on the history table in order to reclaim disk space. This will take a very long time and should not be run on production.")
+		if runVacuum(false) {
+			fmt.Println("done.")
+		} else {
+			os.Exit(1)
+		}
+	}
+
+	// vacuum all
+	if *vacuumAllFlag == true {
+		flagged = true
+		fmt.Println("running 'VACUUM ANALYZE' on each table in BFD. This will take a long time.")
+		if runVacuum(true) {
 			fmt.Println("done.")
 		} else {
 			os.Exit(1)
